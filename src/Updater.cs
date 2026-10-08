@@ -7,10 +7,10 @@ using System.Threading;
 
 namespace Aevalsistant
 {
-    // Updates come from the latest GitHub release of this repository. The release must carry an
-    // asset named Aevalsistant.exe, and may carry Aevalsistant.exe.sha256; the release workflow in
-    // .github/workflows/release.yml publishes both. The repository has to be public: the check
-    // uses GitHub's API without signing in.
+    // Updates come from the latest GitHub release of this repository. The release carries one
+    // asset, Aevalsistant.exe, published by .github/workflows/release.yml. GitHub reports each
+    // asset's SHA-256 as its "digest", and a download that does not match it is thrown away. The
+    // repository has to be public: the check uses GitHub's API without signing in.
     static class Updater
     {
         public const string Repo = "aevalmere/aevalsistant";
@@ -41,26 +41,14 @@ namespace Aevalsistant
                 if (r.Latest == null) { r.Problem = "The latest release has no version tag"; return r; }
                 if (r.Latest <= Current) return r;
 
-                string url = null, sumUrl = null;
-                if (release["assets"] is System.Collections.Generic.List<object> assets)
-                    foreach (var a in assets)
-                    {
-                        var o = a as JObj;
-                        if (o?.Str("name") == Asset) url = o.Str("browser_download_url");
-                        if (o?.Str("name") == Asset + ".sha256") sumUrl = o.Str("browser_download_url");
-                    }
-                if (url == null) { r.Problem = "Release " + r.Latest + " has no " + Asset; return r; }
+                if (!FindAsset(release, out string url, out string expected)) { r.Problem = "Release " + r.Latest.ToString(3) + " has no " + Asset; return r; }
+                if (expected == null) { r.Problem = "Release " + r.Latest.ToString(3) + " has no checksum"; return r; }
 
                 Directory.CreateDirectory(Folder);
                 string part = Path.Combine(Folder, Asset + ".part"), target = Path.Combine(Folder, Asset);
                 using (var web = Client()) web.DownloadFile(url, part);
 
-                if (sumUrl != null)
-                {
-                    string expected;
-                    using (var web = Client()) expected = web.DownloadString(sumUrl).Trim().Split(' ', '\t')[0].ToLowerInvariant();
-                    if (Sha256(part) != expected) { File.Delete(part); r.Problem = "Download did not match its checksum"; return r; }
-                }
+                if (Sha256(part) != expected) { File.Delete(part); r.Problem = "Download did not match its checksum"; return r; }
                 // The file must be this app, at the version the release claims.
                 var name = AssemblyName.GetAssemblyName(part);
                 if (name.Name != "Aevalsistant" || name.Version < r.Latest) { File.Delete(part); r.Problem = "Downloaded file is not the expected build"; return r; }
@@ -77,6 +65,25 @@ namespace Aevalsistant
             return r;
         }
 
+        // The exe's download URL and its lowercase SHA-256 from the release's asset list. The hash
+        // is null when GitHub gave no "sha256:" digest.
+        internal static bool FindAsset(JObj release, out string url, out string sha256)
+        {
+            url = sha256 = null;
+            if (!(release?["assets"] is System.Collections.Generic.List<object> assets)) return false;
+            foreach (var a in assets)
+            {
+                var o = a as JObj;
+                if (o?.Str("name") != Asset) continue;
+                url = o.Str("browser_download_url");
+                string digest = o.Str("digest") ?? "";
+                if (digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) && digest.Length == 7 + 64)
+                    sha256 = digest.Substring(7).ToLowerInvariant();
+                return url != null;
+            }
+            return false;
+        }
+
         // "v1.2.0" -> 1.2.0
         public static Version ParseTag(string tag)
         {
@@ -89,13 +96,26 @@ namespace Aevalsistant
 
         // Start the downloaded exe. It runs the normal install hand-off: asks this copy to quit,
         // copies itself over the installed exe, and starts it.
-        public static void Apply(string downloaded) =>
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(downloaded) { UseShellExecute = false, WorkingDirectory = App.Home });
+        // Returns null, or why the update could not start.
+        public static string Apply(string downloaded)
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(downloaded) { UseShellExecute = false, WorkingDirectory = App.Home });
+                return null;
+            }
+            catch (System.ComponentModel.Win32Exception e) { return e.Message; }   // blocked by antivirus or Smart App Control
+        }
 
-        // Left over from the previous update once the installed copy is running.
+        // Left over from the previous update once the installed copy is running: the download
+        // folder, and the old exe that the hand-off moved aside.
         public static void CleanUp()
         {
-            try { if (Directory.Exists(Folder)) Directory.Delete(Folder, true); }
+            try
+            {
+                if (Directory.Exists(Folder)) Directory.Delete(Folder, true);
+                foreach (var old in Directory.GetFiles(App.Home, "Aevalsistant.exe.*.old")) File.Delete(old);
+            }
             catch (IOException) { /* still in use; next start tries again */ }
             catch (UnauthorizedAccessException) { }
         }

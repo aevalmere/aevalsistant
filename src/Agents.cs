@@ -70,11 +70,12 @@ namespace Aevalsistant
                 Id = "copilot", Name = "Copilot CLI", Dir = ".copilot", File = @".copilot\hooks\aevalsistant.json", Layout = HookLayout.Own,
                 Events = new[] { "userPromptSubmitted", "agentStop", "errorOccurred", "sessionEnd" },
                 // Copilot's camelCase payloads carry no event name, so the command line does.
+                // On Windows Copilot runs the "powershell" field, falling back to "command".
                 OwnContent = cmd =>
                 {
                     var hooks = new JObj();
                     foreach (var ev in new[] { "userPromptSubmitted", "agentStop", "errorOccurred", "sessionEnd" })
-                        hooks[ev] = new List<object> { Obj("type", "command", "command", cmd + " " + ev, "timeoutSec", N(10)) };
+                        hooks[ev] = new List<object> { Obj("type", "command", "command", cmd + " " + ev, "powershell", PowerShell(cmd) + " " + ev, "timeoutSec", N(10)) };
                     return Json.Write(Obj("version", N(1), "hooks", hooks)) + "\n";
                 },
             },
@@ -88,7 +89,8 @@ namespace Aevalsistant
             {
                 Id = "windsurf", Name = "Windsurf", Dir = @".codeium\windsurf", File = @".codeium\windsurf\hooks.json", Layout = HookLayout.Flat,
                 Events = new[] { "pre_user_prompt", "post_cascade_response" },
-                Entry = (ev, cmd) => Obj("command", cmd, "powershell", cmd, "show_output", false),
+                // On Windows Windsurf runs the "powershell" field.
+                Entry = (ev, cmd) => Obj("command", cmd, "powershell", PowerShell(cmd), "show_output", false),
             },
             new AgentSpec
             {
@@ -99,6 +101,32 @@ namespace Aevalsistant
         };
 
         public static AgentSpec Get(string id) => All.FirstOrDefault(a => a.Id == id) ?? All[0];
+
+        // Hook commands run through whichever shell each agent uses (bash, cmd, or PowerShell), so
+        // the exe path should work unquoted in all of them. A folder whose name has a space or a
+        // shell character is swapped for its 8.3 short name. Only those: the Aevalsistant parts
+        // stay long so ClaudeHooks.IsOurs keeps recognizing the command. With short names turned
+        // off, the path is quoted, which bash and cmd accept.
+        internal static string HookPath(string exe, Func<string, string> shortName)
+        {
+            string[] parts = exe.Split('\\');
+            var result = (string[])parts.Clone();
+            for (int i = 1; i < parts.Length; i++)
+            {
+                if (ShellSafe(parts[i])) continue;
+                string s = shortName(string.Join("\\", parts, 0, i + 1));
+                int cut = s?.LastIndexOf('\\') ?? -1;
+                if (cut >= 0) result[i] = s.Substring(cut + 1);
+            }
+            string path = string.Join("/", result);
+            return result.All(ShellSafe) ? path : "\"" + path + "\"";
+        }
+
+        // PowerShell runs a quoted path only behind its call operator.
+        static string PowerShell(string command) => command.StartsWith("\"") ? "& " + command : command;
+
+        static bool ShellSafe(string part) =>
+            part.Length > 0 && part.All(c => char.IsLetterOrDigit(c) || c == '.' || c == '_' || c == '-' || c == '~' || c == ':');
 
         // Claude Code keeps the bare "--hook" form so existing installs do not churn.
         public static string CommandFor(AgentSpec a, string baseCommand) => a.Id == "claude" ? baseCommand : baseCommand + " " + a.Id;
@@ -242,6 +270,10 @@ namespace Aevalsistant
                         case "AfterAgent": e.Name = "Stop"; e.LastAssistant = S("prompt_response"); break;
                         case "SessionEnd": e.Name = "SessionEnd"; break;
                         case "Notification":
+                            // Gemini also sends errors, warnings, and info here. Only a tool
+                            // permission request needs you; versions without the type sent only those.
+                            string kind = S("notification_type");
+                            if (kind.Length > 0 && kind != "ToolPermission") break;
                             e.Name = "Notification";
                             e.NotificationType = "permission_prompt";
                             e.Message = S("message").Length > 0 ? S("message") : "Gemini is asking for permission.";
@@ -346,14 +378,21 @@ namespace Aevalsistant
 "      // Aevalsistant is not installed or not reachable; OpenCode carries on.\n" +
 "    }\n" +
 "  };\n" +
+"  // session.status and the older session.idle both report a finish, so a finish is sent only\n" +
+"  // for a session that was busy, and only once.\n" +
+"  const busy = {};\n" +
 "  return {\n" +
 "    event: async ({ event }) => {\n" +
 "      const p = event.properties || {};\n" +
 "      const id = p.sessionID || (p.info && p.info.id) || \"\";\n" +
-"      if (event.type === \"session.status\" && p.status && p.status.type === \"busy\") send(\"busy\", id);\n" +
-"      else if (event.type === \"session.idle\") send(\"idle\", id);\n" +
-"      else if (event.type === \"session.error\") send(\"error\", id);\n" +
-"      else if (event.type === \"permission.asked\") send(\"permission\", id, p.title || \"\");\n" +
+"      const status = event.type === \"session.status\" && p.status ? p.status.type : \"\";\n" +
+"      if (status === \"busy\") { if (!busy[id]) { busy[id] = true; send(\"busy\", id); } }\n" +
+"      else if (status === \"idle\" || event.type === \"session.idle\") { if (busy[id]) { busy[id] = false; send(\"idle\", id); } }\n" +
+"      else if (event.type === \"session.error\") { busy[id] = false; send(\"error\", id); }\n" +
+"      else if (event.type === \"permission.asked\") {\n" +
+"        const what = (p.permission || \"\") + (p.patterns && p.patterns.length ? \": \" + p.patterns.join(\", \") : \"\");\n" +
+"        send(\"permission\", id, what ? \"OpenCode wants to use \" + what : \"\");\n" +
+"      }\n" +
 "    },\n" +
 "  };\n" +
 "};\n";

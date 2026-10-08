@@ -69,7 +69,14 @@ namespace Aevalsistant
                 PowerReadDCValueIndex(IntPtr.Zero, ref scheme, ref SubButtons, ref LidClose, out uint dc) != 0)
             { error = "Could not read the lid setting."; return null; }
 
-            if (!Write(scheme, 0, 0)) { error = "Windows refused the lid setting change."; return null; }
+            if (!Write(scheme, 0, 0))
+            {
+                // The AC half may have been written before the DC half failed; put it back so the
+                // plan is not left changed with nothing saved to restore it from.
+                Write(scheme, ac, dc);
+                error = "Windows refused the lid setting change.";
+                return null;
+            }
             return scheme.ToString() + "|" + ac.ToString(CultureInfo.InvariantCulture) + "|" + dc.ToString(CultureInfo.InvariantCulture);
         }
 

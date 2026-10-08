@@ -16,7 +16,7 @@ namespace Aevalsistant
         public const int SW_SHOWNOACTIVATE = 4, SW_HIDE = 0, SW_RESTORE = 9;
         public const uint SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-        public const uint GW_OWNER = 4, GA_ROOTOWNER = 3;
+        public const uint GW_OWNER = 4, GA_ROOT = 2, GA_ROOTOWNER = 3;
         public const int ULW_ALPHA = 2;
         public const byte AC_SRC_OVER = 0, AC_SRC_ALPHA = 1;
         public const uint WDA_MONITOR = 0x1, WDA_EXCLUDEFROMCAPTURE = 0x11;
@@ -143,6 +143,18 @@ namespace Aevalsistant
         [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder name, ref int size);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint size);
+        // Takes "file:stream" paths, which File.Delete rejects.
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "DeleteFileW")] public static extern bool DeleteFile(string path);
+        [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr token, int infoClass, out int info, int size, out int returned);
+        const int TokenElevationType = 18, TokenElevationTypeFull = 2;
+
+        // True when UAC is on and this process got the administrator half of the user's token,
+        // as with "Run as administrator". False with UAC off, where every process is the same.
+        public static bool IsElevatedByUac()
+        {
+            using (var id = System.Security.Principal.WindowsIdentity.GetCurrent())
+                return GetTokenInformation(id.Token, TokenElevationType, out int type, 4, out _) && type == TokenElevationTypeFull;
+        }
         public const int ATTACH_PARENT_PROCESS = -1;
         public const uint TH32CS_SNAPPROCESS = 0x2, PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, STILL_ACTIVE = 259;
         public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);

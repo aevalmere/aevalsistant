@@ -125,7 +125,7 @@ namespace Aevalsistant
             return name.Length > 0 ? Path.GetFileNameWithoutExtension(name) : "";
         }
 
-        static string ImagePath(int pid)
+        public static string ImagePath(int pid)
         {
             IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
             if (h == IntPtr.Zero) return "";
@@ -158,10 +158,16 @@ namespace Aevalsistant
             var chain = new List<Proc>();
             var seen = new HashSet<int> { pid };
             int cur = pid;
+            long curStart = StartTime(pid);
             while (parent.TryGetValue(cur, out int up) && up != 0 && seen.Add(up) && name.ContainsKey(up) && chain.Count < 40)
             {
+                // A "parent" that started after its child is some other program that reused the
+                // pid of a parent that has exited. Start time 0 means it could not be read.
+                long upStart = StartTime(up);
+                if (upStart != 0 && curStart != 0 && upStart > curStart) break;
                 chain.Add(new Proc { Pid = up, Name = name[up] });
                 cur = up;
+                curStart = upStart;
             }
             return chain;
         }

@@ -26,10 +26,12 @@ namespace Aevalsistant
             TranscriptParsing();
             Envelope();
             OtherAgents();
+            HookPaths();
             ChatWatching();
             Check(Updater.ParseTag("v1.2.0") == new Version(1, 2, 0, 0) && Updater.ParseTag("1.10") == new Version(1, 10, 0, 0)
                 && Updater.ParseTag("v1.2.0") > new Version(1, 1, 0, 0) && Updater.ParseTag("v1.1.0") == new Version(1, 1, 0, 0)
                 && Updater.ParseTag("nightly") == null, "update: release tags compare against the build version");
+            UpdateAssets();
             Easing();
             if (args.Length > 0 && args[0] == "--menu") { MenuPreview.Run(); return 0; }
             if (args.Length > 1 && args[0] == "--update-from")
@@ -43,6 +45,45 @@ namespace Aevalsistant
             if (args.Length > 0) Previews(args[0]);
             Console.WriteLine($"{passed} passed, {failed} failed");
             return failed == 0 ? 0 : 1;
+        }
+
+        // A user folder with a space used to be shortened along with everything after it
+        // (AEVALS~1\AEVALS~1.EXE), so the app stopped recognizing its own hooks and added another
+        // set on every sync.
+        static void HookPaths()
+        {
+            const string Exe = @"C:\Users\John Smith\AppData\Local\Aevalsistant\Aevalsistant.exe";
+            string shortened = Agents.HookPath(Exe, p => p == @"C:\Users\John Smith" ? @"C:\Users\JOHNSM~1" : null);
+            Check(shortened == "C:/Users/JOHNSM~1/AppData/Local/Aevalsistant/Aevalsistant.exe", "hook path: only the folder with a space is shortened");
+            Check(ClaudeHooks.IsOurs(shortened + " --hook"), "hook path: shortened command is still recognized");
+            var claude = Agents.Get("claude");
+            string once = Agents.Apply(claude, null, shortened + " --hook", out _);
+            string twice = Agents.Apply(claude, once, shortened + " --hook", out bool again);
+            Check(!again && twice == once, "hook path: syncing again adds nothing");
+
+            string quoted = Agents.HookPath(Exe, p => p);   // 8.3 names turned off
+            Check(quoted == "\"C:/Users/John Smith/AppData/Local/Aevalsistant/Aevalsistant.exe\"", "hook path: quoted when there is no short name");
+            Check(Agents.Apply(Agents.Get("windsurf"), null, quoted + " --hook windsurf", out _).Contains("\"powershell\": \"& \\\"C:/Users/John Smith"), "hook path: windsurf's powershell command calls a quoted path with &");
+            Check(Agents.HookPath(@"C:\Users\O'Brien\AppData\Local\Aevalsistant\Aevalsistant.exe", p => p).StartsWith("\""), "hook path: apostrophe is quoted");
+            Check(Agents.HookPath(@"C:\Users\andy\AppData\Local\Aevalsistant\Aevalsistant.exe", p => throw new InvalidOperationException("not needed"))
+                == "C:/Users/andy/AppData/Local/Aevalsistant/Aevalsistant.exe", "hook path: a plain path is left alone");
+        }
+
+        // The shape of api.github.com/repos/{repo}/releases/latest, trimmed to what the updater reads.
+        static void UpdateAssets()
+        {
+            string hash = new string('a', 60) + "B0c9";
+            JObj Release(string assets) => (JObj)Json.Parse("{\"tag_name\":\"v1.3.0\",\"assets\":[" + assets + "]}");
+            string Asset(string name, string digest) =>
+                "{\"name\":\"" + name + "\",\"browser_download_url\":\"https://example.test/" + name + "\"" + (digest == null ? "" : ",\"digest\":" + Json.Quote(digest)) + "}";
+
+            bool found = Updater.FindAsset(Release(Asset("Source.zip", null) + "," + Asset("Aevalsistant.exe", "sha256:" + hash)), out var url, out var sha);
+            Check(found && url == "https://example.test/Aevalsistant.exe" && sha == hash.ToLowerInvariant(), "update: exe and its sha256 digest found");
+            Check(Updater.FindAsset(Release(Asset("Aevalsistant.exe", null)), out _, out sha) && sha == null, "update: missing digest reported as no checksum");
+            Check(Updater.FindAsset(Release(Asset("Aevalsistant.exe", "sha512:" + hash)), out _, out sha) && sha == null, "update: other digest algorithms ignored");
+            Check(Updater.FindAsset(Release(Asset("Aevalsistant.exe", "sha256:abc")), out _, out sha) && sha == null, "update: truncated digest ignored");
+            Check(!Updater.FindAsset(Release(Asset("Aevalsistant.zip", "sha256:" + hash)), out _, out _), "update: release without the exe");
+            Check(!Updater.FindAsset((JObj)Json.Parse("{\"tag_name\":\"v1.3.0\"}"), out _, out _), "update: release without assets");
         }
 
         static void JsonRoundTrip()
@@ -282,6 +323,10 @@ namespace Aevalsistant
             Check(e.Name == "Stop" && e.SessionId == "windsurf:tr" && e.LastAssistant.Contains("All set"), "adapter: windsurf response");
             e = Env("opencode", "{\"event\":\"permission\",\"session\":\"o1\",\"cwd\":\"/p/q\",\"message\":\"Run npm test?\"}");
             Check(e.Name == "Notification" && e.Message == "Run npm test?" && e.SessionId == "opencode:o1", "adapter: opencode permission");
+            Check(Env("gemini", "{\"session_id\":\"g\",\"hook_event_name\":\"Notification\",\"notification_type\":\"ToolPermission\",\"message\":\"Allow shell?\"}").NotificationType == "permission_prompt"
+                && Env("gemini", "{\"session_id\":\"g\",\"hook_event_name\":\"Notification\",\"notification_type\":\"Error\",\"message\":\"Quota\"}") == null, "adapter: gemini only treats tool permission notices as needing you");
+            string copilotFile = Agents.Apply(Agents.Get("copilot"), null, "\"C:/Users/A B/Aevalsistant.exe\" --hook copilot", out _);
+            Check(copilotFile.Contains("\"powershell\": \"& \\\"C:/Users/A B/Aevalsistant.exe\\\" --hook copilot agentStop\""), "install: copilot's powershell command calls a quoted path with &");
 
             // session flow for an agent that sends its reply before Stop
             var t = new DateTime(2026, 10, 8, 2, 0, 0, DateTimeKind.Utc);

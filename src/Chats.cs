@@ -69,7 +69,7 @@ namespace Aevalsistant
         [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
 
         public event Action<HookEvent> Changed;   // raised on the UI thread
-        public event Action Failed;
+        public event Action<string> Failed;       // raised on the UI thread, with the reason
 
         readonly SynchronizationContext ui = SynchronizationContext.Current;
         readonly ChatTracker tracker = new ChatTracker();
@@ -124,12 +124,15 @@ namespace Aevalsistant
                     }
                     foreach (long h in tracker.Watched) Sample(new IntPtr(h), retryIfEmpty: false);
                 }
-                catch (Exception e) when (e is System.IO.FileNotFoundException || e is TypeLoadException)
+                catch (Exception e)
                 {
-                    // UI Automation is part of every Windows .NET install; if it is missing anyway,
-                    // chat watching switches itself off instead of taking the app down.
+                    // An exception escaping this thread would end the whole app, keep-awake
+                    // included, so chat watching switches itself off and the menu says why.
+                    // The expected case: UI Automation missing from a stripped-down Windows.
                     stopped = true;
-                    ui.Post(_ => Failed?.Invoke(), null);
+                    string reason = e is System.IO.FileNotFoundException || e is TypeLoadException
+                        ? "Windows UI Automation did not load" : e.GetType().Name + ": " + e.Message;
+                    ui.Post(_ => Failed?.Invoke(reason), null);
                     return;
                 }
             }
@@ -167,21 +170,17 @@ namespace Aevalsistant
             }
             catch (ElementNotAvailableException) { return null; }   // window closed mid-read
             catch (COMException) { return null; }                   // app not answering accessibility calls
+            catch (TimeoutException) { return null; }               // app hung; UI Automation gave up waiting
             catch (InvalidOperationException) { return null; }
         }
 
-        static string AppOf(IntPtr hwnd) => AppOf(hwnd, out _);
-
-        static string AppOf(IntPtr hwnd, out int pid)
+        // Runs on every foreground change, on the UI thread, so it reads one process's image
+        // name instead of listing every process the way Process.ProcessName does.
+        static string AppOf(IntPtr hwnd)
         {
-            GetWindowThreadProcessId(hwnd, out uint p);
-            pid = (int)p;
-            try
-            {
-                using (var proc = System.Diagnostics.Process.GetProcessById(pid))
-                    return Apps.TryGetValue(proc.ProcessName + ".exe", out var name) ? name : null;
-            }
-            catch (ArgumentException) { return null; }   // already exited
+            GetWindowThreadProcessId(hwnd, out uint pid);
+            string exe = System.IO.Path.GetFileName(Terminals.ImagePath((int)pid));
+            return Apps.TryGetValue(exe, out var name) ? name : null;
         }
 
         public void Dispose()

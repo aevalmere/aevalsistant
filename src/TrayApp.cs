@@ -87,6 +87,7 @@ namespace Aevalsistant
             updateTimer.Tick += (s, e) =>
             {
                 updateTimer.Interval = 6 * 60 * 60 * 1000;   // first check two minutes after start, then every six hours
+                if (pendingUpdate == null) Updater.CleanUp();   // again, in case the copy that handed off was still exiting at start
                 if (settings.AutoUpdate) CheckForUpdates(manual: false);
             };
             updateTimer.Start();
@@ -164,6 +165,16 @@ namespace Aevalsistant
             return h != 0 && Native.IsWindow(new IntPtr(h));
         }
 
+        // Alt+Tab is taken over only when it would go somewhere new. With the session's window
+        // already in front, it stays the normal window switcher.
+        bool CanJump(string sessionId, long hwnd)
+        {
+            if (!CanFocus(sessionId, hwnd)) return false;
+            long h = book.Get(sessionId)?.Hwnd ?? hwnd;
+            IntPtr fg = Native.GetForegroundWindow();
+            return fg == IntPtr.Zero || Native.GetAncestor(fg, Native.GA_ROOT) != new IntPtr(h);
+        }
+
         void FocusTarget(string sessionId, long hwnd)
         {
             long h = book.Get(sessionId)?.Hwnd ?? hwnd;
@@ -206,7 +217,7 @@ namespace Aevalsistant
             var c = new ToastContent
             {
                 Title = top.Title, Detail = top.Detail, Kind = top.Kind, Host = top.Host ?? "",
-                Keycap = CanFocus(top.SessionId, top.Hwnd),
+                Keycap = CanJump(top.SessionId, top.Hwnd),
             };
             var others = book.All.Where(x => x.Id != top.SessionId)
                 .OrderBy(x => Status.State(x) == RowState.NeedsYou ? 0 : Status.State(x) == RowState.Done ? 1 : 2)
@@ -304,7 +315,12 @@ namespace Aevalsistant
             if (chats != null) return;
             chats = new ChatWatcher(hwnd => busyWindows.Contains(hwnd));
             chats.Changed += Ingest;
-            chats.Failed += () => { chats = null; chatProblem = "Chat watching is unavailable: Windows UI Automation did not load"; };
+            chats.Failed += reason =>
+            {
+                chats?.Dispose();   // its foreground hook would otherwise call into a collected delegate
+                chats = null;
+                chatProblem = "Chat watching stopped: " + reason;
+            };
         }
 
         void StopChats()
@@ -348,7 +364,8 @@ namespace Aevalsistant
             if (pendingUpdate == null || book.BusyCount > 0 || toast.Showing || !File.Exists(pendingUpdate)) return;
             string path = pendingUpdate;
             pendingUpdate = null;
-            Updater.Apply(path);
+            string problem = Updater.Apply(path);
+            if (problem != null) updateStatus = "Could not start the update: " + problem;
         }
 
         void RefreshState()
@@ -401,7 +418,7 @@ namespace Aevalsistant
             menu.ImageScalingSize = new Size(dot, dot);
 
             int working = book.BusyCount;
-            menu.Items.Add(Label("Aevalsistant", "header", bold: true));
+            menu.Items.Add(Label("Aevalsistant " + Updater.Current.ToString(3), "header", bold: true));
             menu.Items.Add(Label(working > 0 ? "Keeping awake: " + Plural.Agents(working) + " working" : "Idle. Sleep is allowed.", "status"));
             menu.Items.Add(new ToolStripSeparator());
 
@@ -493,19 +510,12 @@ namespace Aevalsistant
 
         // ---- install surface ----------------------------------------------------------
 
-        static string HookCommand()
+        static string HookCommand() => Agents.HookPath(App.InstalledExe, path =>
         {
-            string path = App.InstalledExe;
-            if (path.IndexOf(' ') >= 0)
-            {
-                // Hook commands run through whichever shell Claude Code uses; an 8.3 path with
-                // forward slashes needs no quoting in bash, cmd, or PowerShell.
-                var sb = new StringBuilder(520);
-                if (Native.GetShortPathName(path, sb, (uint)sb.Capacity) > 0) path = sb.ToString();
-            }
-            path = path.Replace('\\', '/');
-            return (path.IndexOf(' ') >= 0 ? "\"" + path + "\"" : path) + " --hook";
-        }
+            var sb = new StringBuilder(520);
+            uint n = Native.GetShortPathName(path, sb, (uint)sb.Capacity);
+            return n > 0 && n < sb.Capacity ? sb.ToString() : null;
+        }) + " --hook";
 
         static string AgentFile(AgentSpec a) =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), a.File);
@@ -546,9 +556,7 @@ namespace Aevalsistant
                         string backup = path + ".aevalsistant.bak";
                         if (a.Layout != HookLayout.Own && text != null && !File.Exists(backup)) File.WriteAllText(backup, text);
                         if (next == null) File.Delete(path);
-                        // Written in place rather than swapped in, so a symlinked file (dotfile
-                        // managers) stays a symlink.
-                        else File.WriteAllText(path, next, new UTF8Encoding(false));
+                        else WriteConfig(path, next);
                         if (add) justConnected.Add(a.Id);
                     }
                     agentProblems.Remove(a.Id);
@@ -557,6 +565,26 @@ namespace Aevalsistant
                 catch (IOException e) { agentProblems[a.Id] = a.Name + ": could not write " + shown + " (" + e.Message + ")"; }
                 catch (UnauthorizedAccessException) { agentProblems[a.Id] = a.Name + ": no permission to write " + shown; }
             }
+        }
+
+        // Written next to the original and swapped in, so a crash or power cut mid-write cannot
+        // leave an agent's settings half written. A symlink (dotfile managers) is written in
+        // place instead, so it stays a symlink.
+        static void WriteConfig(string path, string text)
+        {
+            var utf8 = new UTF8Encoding(false);
+            if (!File.Exists(path) || (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            {
+                File.WriteAllText(path, text, utf8);
+                return;
+            }
+            string temp = path + ".aevalsistant.tmp";
+            try
+            {
+                File.WriteAllText(temp, text, utf8);
+                File.Replace(temp, path, null);
+            }
+            finally { if (File.Exists(temp)) File.Delete(temp); }
         }
 
         static void SetStartup(bool on)
@@ -571,13 +599,17 @@ namespace Aevalsistant
         void Uninstall()
         {
             var answer = MessageBox.Show(
-                "Remove Aevalsistant? Its Claude Code hooks, its startup entry, and its folder in AppData will be deleted.",
+                "Remove Aevalsistant? Its hooks in every coding agent, its startup entry, and its folder in AppData will be deleted.\n\n"
+                + "Restart open agent sessions afterwards so they stop calling it.",
                 "Aevalsistant", MessageBoxButtons.OKCancel, MessageBoxIcon.None, MessageBoxDefaultButton.Button2);
             if (answer != DialogResult.OK) return;
             SyncAgents(false);
             SetStartup(false);
-            // The exe cannot delete its own folder while running; cmd does it two seconds after exit.
-            Process.Start(new ProcessStartInfo("cmd.exe", "/c ping -n 3 127.0.0.1 >nul & rmdir /s /q \"" + App.Home + "\"")
+            // The exe cannot delete its own folder while running. cmd tries once a second for up
+            // to 15 seconds, since a --hook call or a virus scan can hold the exe after this exits.
+            string home = App.Home;
+            Process.Start(new ProcessStartInfo("cmd.exe",
+                "/c for /l %i in (1,1,15) do (ping -n 2 127.0.0.1 >nul & rmdir /s /q \"" + home + "\" 2>nul & if not exist \"" + home + "\\\" exit)")
             {
                 CreateNoWindow = true, UseShellExecute = false, WorkingDirectory = Path.GetTempPath(),
             });

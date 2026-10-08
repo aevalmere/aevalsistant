@@ -26,6 +26,14 @@ namespace Aevalsistant
             if (args.Length > 0 && args[0] == "--hook")
                 return HookClient.Run(args.Length > 1 ? args[1] : "claude", args.Length > 2 ? args[2] : "");
 
+            if (Native.IsElevatedByUac())
+            {
+                // An elevated tray app's pipe refuses the hook calls of agents running normally.
+                MessageBox.Show("Aevalsistant was started with \"Run as administrator\", so coding agents running normally could not reach it.\n\nStart it again without \"Run as administrator\".",
+                    "Aevalsistant", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return 1;
+            }
+
             string self = Process.GetCurrentProcess().MainModule.FileName;
             bool isInstalled = string.Equals(Path.GetFullPath(self), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase);
 
@@ -48,29 +56,81 @@ namespace Aevalsistant
         // %LOCALAPPDATA%\Aevalsistant so the hook path and the startup entry never move.
         static int InstallAndHandOff(string self)
         {
-            bool running = Mutex.TryOpenExisting(MutexName, out var existing);
-            existing?.Dispose();
+            bool running = IsRunning();
             bool same = File.Exists(InstalledExe) && FilesEqual(self, InstalledExe);
 
             if (running && same) { Send("{\"cmd\":\"hello\"}"); return 0; }
             if (running)
             {
                 Send("{\"cmd\":\"quit\"}");
-                for (int i = 0; i < 40 && Mutex.TryOpenExisting(MutexName, out var m); i++) { m.Dispose(); Thread.Sleep(100); }
+                for (int i = 0; i < 50 && IsRunning(); i++) Thread.Sleep(100);
             }
             try
             {
                 Directory.CreateDirectory(Home);
-                if (!same) File.Copy(self, InstalledExe, true);
+                if (!same) Replace(self);
             }
             catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
             {
                 MessageBox.Show("Could not copy Aevalsistant to " + Home + ".\n\n" + e.Message,
                     "Aevalsistant", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // The installed copy quit to make room; start it again rather than leave nothing running.
+                if (running && File.Exists(InstalledExe)) Start(InstalledExe);
                 return 1;
             }
-            Process.Start(new ProcessStartInfo(InstalledExe) { UseShellExecute = false, WorkingDirectory = Home });
-            return 0;
+            return Start(InstalledExe) ? 0 : 1;
+        }
+
+        // Windows will not overwrite a running exe, but it will rename one. The copy that just
+        // quit, or a --hook call started from it, can hold the file a moment longer, so the old
+        // file is moved aside and Updater.CleanUp deletes it on the next start.
+        static void Replace(string self)
+        {
+            string aside = null;
+            if (File.Exists(InstalledExe))
+            {
+                aside = InstalledExe + "." + DateTime.UtcNow.Ticks + ".old";
+                for (int attempt = 1; ; attempt++)
+                {
+                    try { File.Move(InstalledExe, aside); break; }
+                    catch (IOException) when (attempt < 20) { Thread.Sleep(250); }   // antivirus or a hook call has it open
+                }
+            }
+            try { File.Copy(self, InstalledExe); }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
+            {
+                if (aside != null && !File.Exists(InstalledExe)) File.Move(aside, InstalledExe);
+                throw;
+            }
+            // The browser's "downloaded from the internet" mark would follow the copy and bring
+            // back the SmartScreen prompt at every sign-in. The user already ran this file.
+            Native.DeleteFile(InstalledExe + ":Zone.Identifier");
+        }
+
+        static bool Start(string exe)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = Home });
+                return true;
+            }
+            catch (System.ComponentModel.Win32Exception e)   // blocked by antivirus or Smart App Control
+            {
+                MessageBox.Show("Could not start " + exe + ".\n\n" + e.Message, "Aevalsistant", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+        }
+
+        // An elevated copy's mutex exists but refuses to open for a normal one.
+        public static bool IsRunning()
+        {
+            try
+            {
+                if (!Mutex.TryOpenExisting(MutexName, out var m)) return false;
+                m.Dispose();
+                return true;
+            }
+            catch (UnauthorizedAccessException) { return true; }
         }
 
         static bool FilesEqual(string a, string b)
@@ -95,8 +155,9 @@ namespace Aevalsistant
                 }
                 return true;
             }
-            catch (TimeoutException) { return false; }   // tray app not running
-            catch (IOException) { return false; }        // tray app quit mid-write
+            catch (TimeoutException) { return false; }              // tray app not running
+            catch (IOException) { return false; }                   // tray app quit mid-write
+            catch (UnauthorizedAccessException) { return false; }   // tray app running elevated
         }
     }
 
@@ -106,17 +167,20 @@ namespace Aevalsistant
     {
         public static int Run(string agent, string eventName)
         {
-            try { return Forward(agent, eventName); }
+            try { Forward(agent, eventName); }
+            // A hook must never fail the agent that ran it. Whatever went wrong here (a process
+            // that exited mid-walk, a payload shape nobody expected), the agent carries on.
+            catch (Exception) { }
             finally { Reply(agent); }
+            return 0;
         }
 
-        static int Forward(string agent, string eventName)
+        static void Forward(string agent, string eventName)
         {
             // Tray app not running: return at once instead of waiting on a pipe nobody serves.
-            if (!Mutex.TryOpenExisting(App.MutexName, out var m)) return 0;
-            m.Dispose();
+            if (!App.IsRunning()) return;
             string raw = ReadStdin(TimeSpan.FromSeconds(2));
-            if (raw.Length == 0) return 0;
+            if (raw.Length == 0) return;
 
             long started = Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks;
             string pwd = Environment.CurrentDirectory;
@@ -138,11 +202,10 @@ namespace Aevalsistant
                 + ",\"pidStart\":" + t.AgentStart
                 + ",\"raw\":" + Json.Quote(raw) + "}";
             App.Send(envelope);
-            return 0;   // never block or fail the agent
         }
 
-        // Cursor reads a JSON answer from every hook; an empty one is reported as a failure.
-        // "continue": true lets a prompt through. Other agents read nothing.
+        // Cursor reads a JSON answer from its hooks: beforeSubmitPrompt takes "continue": true to
+        // let the prompt through, and the others ignore it. Other agents read nothing.
         static void Reply(string agent)
         {
             if (agent != "cursor") return;
