@@ -8,7 +8,7 @@ using System.Text;
 
 namespace Aevalsistant
 {
-    static class Tests
+    static partial class Tests
     {
         static int failed, passed;
 
@@ -33,6 +33,7 @@ namespace Aevalsistant
                 && Updater.ParseTag("nightly") == null, "update: release tags compare against the build version");
             UpdateAssets();
             Easing();
+            ToastLayout();
             if (args.Length > 0 && args[0] == "--menu") { MenuPreview.Run(); return 0; }
             if (args.Length > 1 && args[0] == "--update-from")
             {
@@ -43,6 +44,7 @@ namespace Aevalsistant
                 return r.Downloaded != null ? 0 : 1;
             }
             if (args.Length > 0) Previews(args[0]);
+            if (args.Length > 0) ToastPreviews(args[0]);
             Console.WriteLine($"{passed} passed, {failed} failed");
             return failed == 0 ? 0 : 1;
         }
@@ -391,15 +393,15 @@ namespace Aevalsistant
                 new ToastContent { Title = "Aevalsistant is running", Detail = "Restart open Claude Code sessions once so they report here.", Kind = ToastKind.Info },
             };
             var single = cases[1];
-            Check(ToastArt.HitTest(cases[0], 1, 100, 50) == ToastArt.HitHead
-                && ToastArt.HitTest(cases[0], 1, 100, ToastArt.Pad + ToastArt.HeadH + ToastArt.ListTop + ToastArt.RowH * 2 + 5) == 2
-                && ToastArt.HitTest(cases[0], 1, 2, 50) == ToastArt.HitNone
-                && ToastArt.Height(cases[2]) == ToastArt.HeadH, "art: hit test and height follow the list");
+            Check(ToastArt.HitTest(cases[0], 1, 100, 50, 0) == ToastArt.HitHead
+                && ToastArt.HitTest(cases[0], 1, 100, ToastArt.Pad + ToastArt.HeadH + ToastArt.ListTop + ToastArt.RowH * 2 + 5, 0) == 2
+                && ToastArt.HitTest(cases[0], 1, 2, 50, 0) == ToastArt.HitNone
+                && ToastArt.Height(cases[2], 1, 0) == ToastArt.HeadH, "art: hit test and height follow the list");
             int i = 0;
             foreach (var c in cases)
                 foreach (var s in new[] { 1f, 1.5f })
                 {
-                    using (var card = ToastArt.Render(c, s, i == 1 ? 2 : ToastArt.HitNone, avatar))
+                    using (var card = ToastArt.Render(c, s, i == 1 ? 2 : ToastArt.HitNone, avatar, 0))
                         foreach (var bg in new[] { ("light", Color.FromArgb(0xF3, 0xF4, 0xF6)), ("dark", Color.FromArgb(0x1E, 0x1F, 0x22)) })
                             using (var frame = new Bitmap(card.Width + 40, card.Height + 20))
                             using (var g = Graphics.FromImage(frame))

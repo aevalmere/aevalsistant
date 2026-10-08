@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -20,6 +21,9 @@ namespace Aevalsistant
         public string Host = "";
         public string Status = "";   // "working 4m", "done", "needs you"
         public RowState State;
+        // 0: a session. 1: started by the nearest Depth-0 row above it (a subagent, or a
+        // background session), or by the main notification's session when none comes first.
+        public int Depth;
     }
 
     sealed class ToastContent
@@ -29,48 +33,93 @@ namespace Aevalsistant
         public ToastKind Kind;
         public string Host = "";   // which app it is in: "VS Code", "Android Studio", "Claude"...
         public bool Keycap;        // show the Alt Tab hint (only when there is a window to jump to)
-        public System.Collections.Generic.List<ToastRow> Rows = new System.Collections.Generic.List<ToastRow>();
+        public List<ToastRow> Rows = new List<ToastRow>();
         public string Overflow = "";   // "2 more in the tray menu" when the list is cut short
+
+        // The detail broken into lines for one scale. Measuring needs a Graphics, and every
+        // frame of the card opening asks for it again.
+        internal ToastArt.Wrapped Wrap;
     }
 
     // Draws the card into a premultiplied bitmap. No window code here, so it can be rendered
     // to a PNG for review on any machine.
     static class ToastArt
     {
-        public const float W = 420, HeadH = 64, RowH = 28, ListTop = 6, ListBottom = 8, Radius = 16, Pad = 22, TopGap = 16;
-        public const int MaxRows = 6;
+        public const float W = 420, HeadH = 64, RowH = 28, ChildH = 24, ListTop = 6, ListBottom = 8, Radius = 16, Pad = 22, TopGap = 16;
+        public const float LineH = 16;   // pitch of the detail lines once the card opens
+        public const int MaxRows = 6;    // rows drawn under the main notification, children included
+        public const int MaxLines = 8;
 
-        // Hover targets: the main notification, one of the listed rows, or nothing.
-        public const int HitNone = -2, HitHead = -1;
+        // Hover targets: the main notification, one of the listed rows, the card between
+        // targets (list padding, the overflow line), or nothing.
+        public const int HitNone = -2, HitHead = -1, HitCard = -3;
+
+        static readonly StringFormat Typo = new StringFormat(StringFormat.GenericTypographic);
 
         static int RowCount(ToastContent c) => c.Rows.Count + (c.Overflow.Length > 0 ? 1 : 0);
 
-        public static float Height(ToastContent c) =>
-            HeadH + (RowCount(c) > 0 ? ListTop + RowCount(c) * RowH + ListBottom : 0);
+        static float RowHeight(ToastContent c, int i) => i < c.Rows.Count && c.Rows[i].Depth > 0 ? ChildH : RowH;
 
-        public static int PixelHeight(ToastContent c, float s) => (int)Math.Ceiling((Height(c) + Pad * 2) * s);
-
-        // Which part of the card a point (in bitmap coordinates) is over.
-        public static int HitTest(ToastContent c, float s, float x, float y)
+        static float ListHeight(ToastContent c)
         {
-            var card = new RectangleF(Pad * s, Pad * s, W * s, Height(c) * s);
-            if (!card.Contains(x, y)) return HitNone;
-            if (y < card.Y + HeadH * s) return HitHead;
-            int i = (int)Math.Floor((y - card.Y - (HeadH + ListTop) * s) / (RowH * s));
-            return i >= 0 && i < c.Rows.Count ? i : HitNone;
+            int n = RowCount(c);
+            if (n == 0) return 0;
+            float h = ListTop + ListBottom;
+            for (int i = 0; i < n; i++) h += RowHeight(c, i);
+            return h;
         }
 
-        public static Bitmap Render(ToastContent c, float s, int hover, Image avatar)
+        // How much taller the main row gets to show the whole detail: 0 when it fits on one line.
+        public static float ExtraHeight(ToastContent c, float s) => (Wrap(c, s).Lines.Length - 1) * LineH;
+
+        // Whole pixels, so the lower edge stays crisp and the shadow can be stretched by rows.
+        static float Grow(ToastContent c, float s, float expand) =>
+            (float)Math.Round(ExtraHeight(c, s) * s * Math.Max(0, Math.Min(1, expand)));
+
+        public static float Height(ToastContent c, float s, float expand) => HeadH + Grow(c, s, expand) / s + ListHeight(c);
+
+        public static int PixelWidth(float s) => (int)Math.Ceiling((W + Pad * 2) * s);
+
+        // Always the open card's height, so a window keeps one surface while it opens and closes.
+        public static int PixelHeight(ToastContent c, float s) => (int)Math.Ceiling((Height(c, s, 1) + Pad * 2) * s);
+
+        // Which part of the card a point (in bitmap coordinates) is over.
+        public static int HitTest(ToastContent c, float s, float x, float y, float expand)
         {
-            int cw = (int)Math.Ceiling((W + Pad * 2) * s), ch = PixelHeight(c, s);
-            var bmp = new Bitmap(cw, ch, PixelFormat.Format32bppPArgb);
-            var card = new RectangleF(Pad * s, Pad * s, W * s, Height(c) * s);
-            var head = new RectangleF(card.X, card.Y, card.Width, HeadH * s);
+            var card = new RectangleF(Pad * s, Pad * s, W * s, Height(c, s, expand) * s);
+            if (!card.Contains(x, y)) return HitNone;
+            float ly = (y - card.Y - Grow(c, s, expand)) / s;   // as if the card were closed
+            if (ly < HeadH) return HitHead;
+            ly -= HeadH + ListTop;
+            for (int i = 0; i < c.Rows.Count; i++)
+            {
+                float h = RowHeight(c, i);
+                if (ly >= 0 && ly < h) return i;
+                ly -= h;
+            }
+            return HitCard;
+        }
+
+        public static Bitmap Render(ToastContent c, float s, int hover, Image avatar, float expand)
+        {
+            var bmp = new Bitmap(PixelWidth(s), PixelHeight(c, s), PixelFormat.Format32bppPArgb);
+            Render(bmp, c, s, hover, avatar, expand);
+            return bmp;
+        }
+
+        // Into a bitmap of PixelWidth by PixelHeight, so a window can reuse one for every frame.
+        public static void Render(Bitmap bmp, ToastContent c, float s, int hover, Image avatar, float expand)
+        {
+            var wrap = Wrap(c, s);
+            float grow = Grow(c, s, expand), closedH = (HeadH + ListHeight(c)) * s;
+            var card = new RectangleF(Pad * s, Pad * s, W * s, closedH + grow);
+            // The avatar, title, and keycaps keep to the closed card's top band; the detail and
+            // everything under it move down as the card opens.
+            var band = new RectangleF(card.X, card.Y, card.Width, HeadH * s);
+            PutShadow(bmp, new RectangleF(card.X, card.Y, card.Width, closedH), s, (int)grow);
 
             using (var g = Graphics.FromImage(bmp))
             {
-                g.Clear(Color.Transparent);
-                g.DrawImageUnscaled(Shadow(cw, ch, card, s), 0, 0);
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
@@ -85,7 +134,7 @@ namespace Aevalsistant
 
                 // avatar
                 float av = 40 * s;
-                var avRect = new RectangleF(head.X + 12 * s, head.Y + (head.Height - av) / 2, av, av);
+                var avRect = new RectangleF(band.X + 12 * s, band.Y + (band.Height - av) / 2, av, av);
                 if (avatar != null)
                 {
                     using (var clip = new GraphicsPath())
@@ -108,17 +157,17 @@ namespace Aevalsistant
                 }
 
                 // keycaps, laid out from the right edge inward
-                float right = head.Right - 14 * s;
+                float right = band.Right - 14 * s;
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                 if (c.Keycap)
                 {
-                    right = Key(g, "Tab", right, head, s) - 4 * s;
-                    right = Key(g, "Alt", right, head, s) - 8 * s;
+                    right = Key(g, "Tab", right, band, s) - 4 * s;
+                    right = Key(g, "Alt", right, band, s) - 8 * s;
                 }
 
                 g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-                float x = avRect.Right + 14 * s;
-                var fmt = new StringFormat(StringFormat.GenericTypographic)
+                float x = card.X + TextLeft(s);
+                var fmt = new StringFormat(Typo)
                 {
                     FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter, LineAlignment = StringAlignment.Center,
                 };
@@ -129,48 +178,176 @@ namespace Aevalsistant
                 using (var slate = new SolidBrush(Theme.Slate))
                 {
                     bool oneLine = string.IsNullOrEmpty(c.Detail);
-                    float ty = oneLine ? head.Y : head.Y + 12 * s, th = oneLine ? head.Height : 20 * s;
+                    float ty = oneLine ? band.Y : band.Y + 12 * s, th = oneLine ? band.Height : 20 * s;
                     NameAndHost(g, c.Title, c.Host, title, host, ink, slate, fmt, x, ty, right - x - 4 * s, th, s);
-                    if (!oneLine) g.DrawString(c.Detail, detail, slate, new RectangleF(x, head.Y + 32 * s, right - x - 4 * s, 18 * s), fmt);
+                    if (!oneLine) DrawDetail(g, wrap, detail, slate, x, band.Y + 32 * s, grow, band.Bottom + grow - 14 * s, s);
 
-                    if (RowCount(c) > 0) DrawRows(g, c, card, avRect, x, hover, s, fmt, ink, slate);
+                    if (RowCount(c) > 0) DrawRows(g, c, card, band.Bottom + grow, avRect, x, hover, s, fmt, ink, slate);
                 }
             }
-            return bmp;
         }
 
-        // The other sessions: a hairline under the main notification, then one row each,
-        // with the dot under the avatar and the text on the title's left edge.
-        static void DrawRows(Graphics g, ToastContent c, RectangleF card, RectangleF avRect, float x, int hover, float s,
+        // From the card's left edge: past the avatar and its gap.
+        static float TextLeft(float s) => (12 + 40 + 14) * s;
+
+        // The detail: one line while the card is closed, the whole text as it opens. Lines past
+        // the first are uncovered by the card's lower edge and fade in as they clear it.
+        static void DrawDetail(Graphics g, Wrapped w, Font f, Brush slate, float x, float top, float grow, float bottom, float s)
+        {
+            var line = new StringFormat(Typo) { FormatFlags = Typo.FormatFlags | StringFormatFlags.NoWrap, LineAlignment = StringAlignment.Center };
+            float lh = LineH * s, boxH = 18 * s, room = w.Width + 8 * s;
+            if (w.Lines.Length == 1)
+            {
+                g.DrawString(w.Lines[0], f, slate, new RectangleF(x, top, room, boxH), line);
+                return;
+            }
+
+            // The first line keeps its words in place and trades the ellipsis for the rest of
+            // the line, so nothing jumps when the card starts to open.
+            float k = Math.Min(1, grow / lh);
+            g.DrawString(w.Prefix, f, slate, new RectangleF(x, top, room, boxH), line);
+            var tail = new RectangleF(x + w.PrefixW, top, room, boxH);
+            if (k < 1) using (var b = Faded(1 - k)) g.DrawString("…", f, b, tail, line);
+            if (k > 0) using (var b = Faded(k)) g.DrawString(w.Lines[0].Substring(w.Prefix.Length), f, b, tail, line);
+            if (grow <= 0) return;
+
+            g.SetClip(new RectangleF(x, top, room, bottom - top));
+            for (int i = 1; i < w.Lines.Length; i++)
+            {
+                float a = Math.Min(1, (grow - (i - 1) * lh) / lh);
+                if (a <= 0) break;
+                using (var b = Faded(a)) g.DrawString(w.Lines[i], f, b, new RectangleF(x, top + i * lh, room, boxH), line);
+            }
+            g.ResetClip();
+        }
+
+        static SolidBrush Faded(float a) => new SolidBrush(Color.FromArgb((int)Math.Round(255 * Math.Max(0, Math.Min(1, a))), Theme.Slate));
+
+        internal sealed class Wrapped
+        {
+            public float Scale;
+            public string Text;
+            public bool Keycap;      // the keycaps take width from the detail line
+            public float Width;      // the detail line, from the title's left edge to the keycaps
+            public string[] Lines;   // at most MaxLines; the last ends in an ellipsis when the text runs on
+            public string Prefix;    // the closed card shows Prefix and an ellipsis when there are more lines
+            public float PrefixW;
+        }
+
+        // ExtraHeight is asked outside of any drawing, so measuring has a Graphics of its own.
+        static Bitmap measureBitmap;
+        static Graphics measurer;
+
+        static Wrapped Wrap(ToastContent c, float s)
+        {
+            var w = c.Wrap;
+            string detail = c.Detail ?? "";
+            if (w != null && w.Scale == s && w.Keycap == c.Keycap && w.Text == detail) return w;
+            if (measurer == null)
+            {
+                measureBitmap = new Bitmap(1, 1, PixelFormat.Format32bppPArgb);
+                measurer = Graphics.FromImage(measureBitmap);
+            }
+            var g = measurer;
+            w = new Wrapped { Scale = s, Text = detail, Keycap = c.Keycap };
+
+            // the same right edge Render reaches by laying out the keycaps
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            float right = W * s - 14 * s;
+            if (c.Keycap)
+                using (var key = Theme.Semibold(10.5f * s))
+                    right -= KeyWidth(g, "Tab", key, s) + 4 * s + KeyWidth(g, "Alt", key, s) + 8 * s;
+            w.Width = right - TextLeft(s) - 4 * s;
+
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            string text = string.Join(" ", detail.Split((char[])null, StringSplitOptions.RemoveEmptyEntries));
+            var lines = new List<string>();
+            using (var f = Theme.Font(12f * s))
+            {
+                // one line tall, so GDI+ reports how much of the rest fits on the next line
+                var box = new SizeF(w.Width, f.GetHeight(g) * 1.5f);
+                int at = 0;
+                while (at < text.Length)
+                {
+                    string rest = text.Substring(at);
+                    g.MeasureString(rest, f, box, Typo, out int fits, out _);
+                    fits = Math.Max(1, Math.Min(fits, rest.Length));
+                    if (lines.Count == MaxLines - 1 && fits < rest.Length)
+                    {
+                        lines.Add(Clip(g, f, rest.Substring(0, fits), w.Width) + "…");
+                        break;
+                    }
+                    lines.Add(rest.Substring(0, fits).TrimEnd());
+                    at += fits;
+                    while (at < text.Length && text[at] == ' ') at++;
+                }
+                if (lines.Count == 0) lines.Add("");
+                w.Lines = lines.ToArray();
+                w.Prefix = lines.Count > 1 ? Clip(g, f, lines[0], w.Width) : lines[0];
+                w.PrefixW = Measure(g, w.Prefix, f);
+            }
+            c.Wrap = w;
+            return w;
+        }
+
+        // Drops whole words until the line and an ellipsis fit; a single long word loses letters
+        // instead. A sentence's last stop goes too, or it reads as "intact.…".
+        static string Clip(Graphics g, Font f, string line, float width)
+        {
+            string t = line.TrimEnd(ClipTrim);
+            while (t.Length > 0 && Measure(g, t + "…", f) > width)
+            {
+                int cut = t.LastIndexOf(' ');
+                t = (cut > 0 ? t.Substring(0, cut) : t.Substring(0, t.Length - 1)).TrimEnd(ClipTrim);
+            }
+            return t;
+        }
+
+        static readonly char[] ClipTrim = { ' ', '.', ',', ';', ':' };
+
+        static float Measure(Graphics g, string text, Font f) => g.MeasureString(text, f, PointF.Empty, Typo).Width;
+
+        // The other sessions: a hairline under the main notification, then one row each, with
+        // the dot under the avatar and the text on the title's left edge. A child sits under its
+        // session on a shorter row with a smaller dot, hung from the session's dot by an elbow.
+        static void DrawRows(Graphics g, ToastContent c, RectangleF card, float top, RectangleF avRect, float x, int hover, float s,
             StringFormat fmt, Brush ink, Brush slate)
         {
-            float top = card.Y + HeadH * s;
             using (var line = new Pen(Theme.PaperEdge, Math.Max(1f, s)))
                 g.DrawLine(line, card.X + 14 * s, top, card.Right - 14 * s, top);
 
-            float dotX = avRect.X + avRect.Width / 2;
+            int n = RowCount(c);
+            var ys = new float[n + 1];
+            ys[0] = top + ListTop * s;
+            for (int i = 0; i < n; i++) ys[i + 1] = ys[i] + RowHeight(c, i) * s;
+
+            float dotX = avRect.X + avRect.Width / 2, childDotX = x + 3 * s, childX = x + 16 * s;
+            if (hover >= 0 && hover < c.Rows.Count)
+                using (var tint = new SolidBrush(Theme.PaperDeep))
+                using (var p = Theme.Round(new RectangleF(card.X + 6 * s, ys[hover], card.Width - 12 * s, ys[hover + 1] - ys[hover]), 8 * s))
+                    g.FillPath(tint, p);
+            Connectors(g, c, ys, dotX, childDotX - 6 * s, avRect.Bottom + 4 * s, s);
+
             var right = new StringFormat(fmt) { Alignment = StringAlignment.Far };
             using (var name = Theme.Font(12.5f * s))
+            using (var childName = Theme.Font(12f * s))
             using (var small = Theme.Font(11.5f * s))
-            using (var tint = new SolidBrush(Theme.PaperDeep))
             {
-                for (int i = 0; i < RowCount(c); i++)
+                for (int i = 0; i < n; i++)
                 {
-                    float y = top + (ListTop + i * RowH) * s;
-                    var row = new RectangleF(card.X + 6 * s, y, card.Width - 12 * s, RowH * s);
+                    float y = ys[i], h = ys[i + 1] - ys[i];
+                    var row = new RectangleF(card.X + 6 * s, y, card.Width - 12 * s, h);
                     if (i >= c.Rows.Count)
                     {
                         g.DrawString(c.Overflow, small, slate, new RectangleF(x, y, row.Right - x - 10 * s, row.Height), fmt);
                         break;
                     }
                     var r = c.Rows[i];
-                    if (hover == i)
-                        using (var p = Theme.Round(row, 8 * s)) g.FillPath(tint, p);
-
-                    float d = 8 * s;
-                    var dot = new RectangleF(dotX - d / 2, y + (row.Height - d) / 2, d, d);
+                    bool child = r.Depth > 0;
+                    float d = (child ? 6 : 8) * s, cx = child ? childDotX : dotX, tx = child ? childX : x;
+                    var dot = new RectangleF(cx - d / 2, y + (h - d) / 2, d, d);
                     if (r.State == RowState.Working)
-                        using (var pen = new Pen(Theme.Slate, 1.4f * s)) g.DrawEllipse(pen, RectangleF.Inflate(dot, -0.7f * s, -0.7f * s));
+                        using (var pen = new Pen(Theme.Slate, (child ? 1.2f : 1.4f) * s)) g.DrawEllipse(pen, RectangleF.Inflate(dot, -0.7f * s, -0.7f * s));
                     else
                         using (var b = new SolidBrush(r.State == RowState.NeedsYou ? Theme.Blush : Theme.SlateSoft)) g.FillEllipse(b, dot);
 
@@ -178,16 +355,52 @@ namespace Aevalsistant
                     float statusRight = row.Right - 10 * s;
                     g.DrawString(r.Status, small, r.State == RowState.NeedsYou ? ink : slate,
                         new RectangleF(statusRight - statusW, y, statusW, row.Height), right);
-                    NameAndHost(g, r.Name, r.Host, name, small, ink, slate, fmt, x, y, statusRight - statusW - 12 * s - x, row.Height, s);
+                    NameAndHost(g, r.Name, r.Host, child ? childName : name, small, ink, slate, fmt, tx, y, statusRight - statusW - 12 * s - tx, row.Height, s);
                 }
             }
         }
+
+        // One vertical run per family from the session's dot (or from under the avatar, for
+        // children of the main notification's session), with an arm out to each child's dot.
+        static void Connectors(Graphics g, ToastContent c, float[] ys, float dotX, float armEnd, float headFrom, float s)
+        {
+            float pw = Math.Max(1, (float)Math.Round(s)), lx = Snap(dotX, pw), r = 4 * s;
+            using (var path = new GraphicsPath())
+            {
+                float from = headFrom;
+                for (int i = 0; i < c.Rows.Count; i++)
+                {
+                    float cy = Snap((ys[i] + ys[i + 1]) / 2, pw);
+                    if (c.Rows[i].Depth == 0) { from = cy + 7 * s; continue; }   // clear of the session's dot
+                    bool last = i + 1 == c.Rows.Count || c.Rows[i + 1].Depth == 0;
+                    path.StartFigure();
+                    if (last)
+                    {
+                        path.AddLine(lx, from, lx, cy - r);
+                        path.AddArc(lx, cy - 2 * r, 2 * r, 2 * r, 180, -90);
+                        path.AddLine(lx + r, cy, armEnd, cy);
+                    }
+                    else
+                    {
+                        path.AddLine(lx, from, lx, cy);
+                        path.StartFigure();
+                        path.AddLine(lx, cy, armEnd, cy);
+                    }
+                    from = cy;
+                }
+                if (path.PointCount == 0) return;
+                using (var pen = new Pen(Theme.SlateMist, pw)) g.DrawPath(pen, path);
+            }
+        }
+
+        // A stroke of whole-pixel width lands on whole pixels: odd widths on a pixel's center.
+        static float Snap(float v, float width) => (int)width % 2 == 1 ? (float)Math.Floor(v) + 0.5f : (float)Math.Round(v);
 
         // "aevalrena finished  ·  VS Code". The name wins: the app shrinks first, to a stub.
         static void NameAndHost(Graphics g, string text, string hostName, Font main, Font sub, Brush mainBrush, Brush subBrush,
             StringFormat fmt, float x, float y, float width, float height, float s)
         {
-            string hostText = string.IsNullOrEmpty(hostName) ? "" : "\u00B7  " + hostName;
+            string hostText = string.IsNullOrEmpty(hostName) ? "" : "·  " + hostName;
             float gap = 5 * s;
             float textFull = g.MeasureString(text, main, PointF.Empty, fmt).Width + 2 * s;
             float hostFull = hostText.Length == 0 ? 0 : g.MeasureString(hostText, sub, PointF.Empty, fmt).Width + 2 * s;
@@ -202,31 +415,50 @@ namespace Aevalsistant
             if (hostW > 0) g.DrawString(hostText, sub, subBrush, new RectangleF(x + textW + gap, y + 0.5f * s, hostW, height), fmt);
         }
 
-        // The shadow depends only on the card size, so it is blurred once per size and reused
-        // for hover redraws.
-        static Bitmap shadow;
+        // The shadow depends only on the closed card's size, so it is blurred once per size and
+        // reused for hover redraws. Opening the card repeats a row from the middle, where the
+        // rows of a blurred rounded rectangle are alike, instead of blurring again every frame.
+        static byte[] shadow;
         static string shadowKey;
 
-        static Bitmap Shadow(int cw, int ch, RectangleF card, float s)
+        static void PutShadow(Bitmap bmp, RectangleF closed, float s, int grow)
         {
-            string key = cw + "x" + ch + "@" + s;
-            if (key == shadowKey) return shadow;
-            shadow?.Dispose();
-            shadow = new Bitmap(cw, ch, PixelFormat.Format32bppPArgb);
-            DrawShadow(shadow, card, Radius * s, 6 * s, 9 * s, 0.17f);
-            DrawShadow(shadow, card, Radius * s, 1 * s, 1.5f * s, 0.10f);
-            shadowKey = key;
-            return shadow;
+            int w = bmp.Width, h = bmp.Height;
+            string key = w + "x" + h + ":" + closed.Height + "@" + s;
+            if (key != shadowKey)
+            {
+                using (var b = new Bitmap(w, h, PixelFormat.Format32bppPArgb))
+                {
+                    DrawShadow(b, closed, Radius * s, 6 * s, 9 * s, 0.17f);
+                    DrawShadow(b, closed, Radius * s, 1 * s, 1.5f * s, 0.10f);
+                    var bd = b.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                    shadow = new byte[bd.Stride * h];
+                    Marshal.Copy(bd.Scan0, shadow, 0, shadow.Length);
+                    b.UnlockBits(bd);
+                }
+                shadowKey = key;
+            }
+
+            int mid = Math.Min(h - 1, (int)(closed.Y + closed.Height / 2));
+            grow = Math.Max(0, Math.Min(grow, h - mid));
+            var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+            int stride = data.Stride;
+            Marshal.Copy(shadow, 0, data.Scan0, mid * stride);
+            for (int r = 0; r < grow; r++) Marshal.Copy(shadow, mid * stride, data.Scan0 + (mid + r) * stride, stride);
+            Marshal.Copy(shadow, mid * stride, data.Scan0 + (mid + grow) * stride, (h - mid - grow) * stride);
+            bmp.UnlockBits(data);
         }
 
+        static float KeyWidth(Graphics g, string text, Font f, float s) =>
+            Math.Max(g.MeasureString(text, f, PointF.Empty, Typo).Width + 12 * s, 24 * s);
+
         // A small keycap with a slightly heavier lower edge. Returns its left edge.
-        static float Key(Graphics g, string text, float right, RectangleF head, float s)
+        static float Key(Graphics g, string text, float right, RectangleF band, float s)
         {
             using (var f = Theme.Semibold(10.5f * s))
             {
-                var size = g.MeasureString(text, f, PointF.Empty, StringFormat.GenericTypographic);
-                float w = Math.Max(size.Width + 12 * s, 24 * s), h = 20 * s;
-                var r = new RectangleF(right - w, head.Y + (head.Height - h) / 2, w, h);
+                float w = KeyWidth(g, text, f, s), h = 20 * s;
+                var r = new RectangleF(right - w, band.Y + (band.Height - h) / 2, w, h);
                 using (var path = Theme.Round(r, 5 * s))
                 using (var bg = new SolidBrush(Theme.PaperDeep))
                 using (var fg = new SolidBrush(Theme.Slate))
@@ -235,7 +467,7 @@ namespace Aevalsistant
                         using (var lipBrush = new SolidBrush(Theme.PaperEdge))
                             g.FillPath(lipBrush, lip);
                     g.FillPath(bg, path);
-                    var fmt = new StringFormat(StringFormat.GenericTypographic) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+                    var fmt = new StringFormat(Typo) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
                     g.DrawString(text, f, fg, new RectangleF(r.X, r.Y + 0.5f * s, r.Width, r.Height), fmt);
                 }
                 return r.X;
@@ -356,11 +588,14 @@ namespace Aevalsistant
     {
         enum Phase { Hidden, Entering, Shown, Leaving }
 
-        const double EnterMs = 360, ExitMs = 220, FadeOnlyEnterMs = 180, FadeOnlyExitMs = 160;
+        const double EnterMs = 360, ExitMs = 220, FadeOnlyEnterMs = 180, FadeOnlyExitMs = 160, OpenMs = 240, CloseMs = 200;
         static readonly TimeSpan UserAwayAfter = TimeSpan.FromSeconds(20);
 
-        public event Action<int> Clicked;   // ToastArt.HitHead, or the index of a listed session
+        public event Action<int> Clicked;   // ToastArt.HitHead, or the index of a listed row, children included
         public event Action AltTabbed, Expired, Dismissed;
+
+        // Hovering the card opens it to the whole detail when the detail runs past one line.
+        public bool ExpandOnHover { get; set; } = true;
 
         readonly SynchronizationContext ui = SynchronizationContext.Current;
         readonly Bitmap avatar = Theme.Resource("avatar.png");
@@ -374,14 +609,16 @@ namespace Aevalsistant
         float scale = 1;
         int hover = ToastArt.HitNone;
         bool reduced;
+        Bitmap frame;
         byte[] card; int cw, ch, stride;
         IntPtr memDc, dib, oldObj, bits;
         int ww, wh, winX, winY;
         int monitorLeft, monitorWidth;
         Phase phase = Phase.Hidden;
         double t0, fromY, fromA, toY, toA, curY, curA, duration;
+        double expand, expandFrom, expandTo, expandT0, expandMs;   // 0 closed, 1 open
         double dwellLeft;
-        volatile bool animating;
+        volatile bool animating, resizing;   // the drop or fade; the card opening or closing
         int framePosted;
 
         public bool Showing => phase == Phase.Entering || phase == Phase.Shown;
@@ -413,13 +650,17 @@ namespace Aevalsistant
             reduced = ReducedMotion();
             if (phase == Phase.Hidden) Place();
             else if (ToastArt.PixelHeight(c, scale) != ch) Reflow();
+            // An open card stays open across a list refresh while the new detail still needs the room.
+            ExpandTo(hover != ToastArt.HitNone ? 1 : 0);
             Rebuild();
 
             if (c.Keycap) keys.Arm(); else keys.Disarm();
 
             if (phase == Phase.Shown || phase == Phase.Entering) { Present(curY, curA); return; }
 
-            double startY = reduced ? FinalY : -ch;
+            // From just above the screen edge: the surface is taller than the closed card, and
+            // starting from its full height would make the drop faster.
+            double startY = reduced ? FinalY : -Math.Ceiling((ToastArt.Height(c, scale, (float)expand) + ToastArt.Pad * 2) * scale);
             Animate(Phase.Entering, phase == Phase.Leaving ? curY : startY, phase == Phase.Leaving ? curA : 0,
                 FinalY, 255, reduced ? FadeOnlyEnterMs : EnterMs);
             SetWindowPos(Handle, HWND_TOPMOST, winX, winY, ww, wh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -451,27 +692,28 @@ namespace Aevalsistant
             Reflow();
         }
 
-        // Size the window for the current content; the list under the main row changes its height.
+        // Size the window for the current content, open: the list under the main row and the
+        // length of the detail change its height. Opening and closing then only redraw.
         void Reflow()
         {
-            cw = (int)Math.Ceiling((ToastArt.W + ToastArt.Pad * 2) * scale);
+            cw = ToastArt.PixelWidth(scale);
             ch = ToastArt.PixelHeight(content, scale);
             ww = cw;
             wh = (int)FinalY + ch;
             winX = monitorLeft + (monitorWidth - cw) / 2;
+            frame?.Dispose();
+            frame = new Bitmap(cw, ch, PixelFormat.Format32bppPArgb);
             AllocSurface();
         }
 
         void Rebuild()
         {
-            using (var bmp = ToastArt.Render(content, scale, hover, avatar))
-            {
-                var data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
-                stride = data.Stride;
-                card = new byte[stride * bmp.Height];
-                Marshal.Copy(data.Scan0, card, 0, card.Length);
-                bmp.UnlockBits(data);
-            }
+            ToastArt.Render(frame, content, scale, hover, avatar, (float)expand);
+            var data = frame.LockBits(new Rectangle(0, 0, cw, ch), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+            stride = data.Stride;
+            if (card == null || card.Length != stride * ch) card = new byte[stride * ch];
+            Marshal.Copy(data.Scan0, card, 0, card.Length);
+            frame.UnlockBits(data);
         }
 
         void AllocSurface()
@@ -499,7 +741,7 @@ namespace Aevalsistant
         static readonly byte[] zeros = new byte[1 << 16];
 
         // One frame: the pre-rendered card copied into the window surface at row offset y.
-        // Only position and opacity change between frames, so nothing is redrawn.
+        // The drop and fade change only position and opacity, so they redraw nothing.
         void Present(double y, double a)
         {
             curY = y; curA = a;
@@ -532,22 +774,57 @@ namespace Aevalsistant
             wake.Set();
         }
 
+        // Opens (1) or closes (0) the card. A detail that fits on one line never opens.
+        void ExpandTo(double to)
+        {
+            if (!ExpandOnHover || content == null || ToastArt.ExtraHeight(content, scale) <= 0)
+            {
+                expand = expandTo = 0;
+                resizing = false;
+                return;
+            }
+            if (to == expandTo) return;
+            expandFrom = expand;
+            expandTo = to;
+            if (reduced) { expand = to; resizing = false; return; }
+            // turning back part way covers only the distance already travelled
+            expandMs = Math.Max(1, (to > expand ? OpenMs : CloseMs) * Math.Abs(to - expand));
+            expandT0 = clock.Elapsed.TotalMilliseconds;
+            resizing = true;
+            wake.Set();
+        }
+
         void Step()
         {
+            if (resizing)
+            {
+                double p = Math.Min(1, (clock.Elapsed.TotalMilliseconds - expandT0) / expandMs);
+                expand = expandFrom + (expandTo - expandFrom) * (expandTo > expandFrom ? Ease.Enter(p) : Ease.Exit(p));
+                if (p >= 1) resizing = false;
+                // The rows slide under a cursor that is standing still, so the row under it
+                // changes without a mouse move.
+                if (hover != ToastArt.HitNone)
+                {
+                    int under = CursorTarget();
+                    if (under != ToastArt.HitNone) hover = under;
+                }
+                Rebuild();
+                if (!animating) Present(curY, curA);
+            }
             if (!animating) return;
-            double p = Math.Min(1, (clock.Elapsed.TotalMilliseconds - t0) / duration);
+            double t = Math.Min(1, (clock.Elapsed.TotalMilliseconds - t0) / duration);
             if (phase == Phase.Entering)
             {
-                double e = Ease.Enter(p);
+                double e = Ease.Enter(t);
                 // opacity leads position: fully opaque by 55% of the drop
-                Present(fromY + (toY - fromY) * e, fromA + (toA - fromA) * Ease.Enter(Math.Min(1, p / 0.55)));
+                Present(fromY + (toY - fromY) * e, fromA + (toA - fromA) * Ease.Enter(Math.Min(1, t / 0.55)));
             }
             else
             {
-                double e = Ease.Exit(p);
+                double e = Ease.Exit(t);
                 Present(fromY + (toY - fromY) * e, fromA + (toA - fromA) * e);
             }
-            if (p < 1) return;
+            if (t < 1) return;
 
             animating = false;
             if (phase == Phase.Entering) { phase = Phase.Shown; dwell.Start(); }
@@ -556,6 +833,8 @@ namespace Aevalsistant
                 phase = Phase.Hidden;
                 ShowWindow(Handle, SW_HIDE);
                 hover = ToastArt.HitNone;
+                expand = expandTo = 0;
+                resizing = false;
             }
         }
 
@@ -564,7 +843,7 @@ namespace Aevalsistant
             while (true)
             {
                 wake.WaitOne();
-                while (animating)
+                while (animating || resizing)
                 {
                     // Paced by the compositor so every step lands on a real frame.
                     if (DwmFlush() != 0) Thread.Sleep(8);
@@ -588,7 +867,13 @@ namespace Aevalsistant
         {
             if (content == null) return ToastArt.HitNone;
             int x = (short)(lParam.ToInt64() & 0xFFFF), y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
-            return ToastArt.HitTest(content, scale, x, (float)(y - curY));
+            return ToastArt.HitTest(content, scale, x, (float)(y - curY), (float)expand);
+        }
+
+        int CursorTarget()
+        {
+            GetCursorPos(out var pt);
+            return ToastArt.HitTest(content, scale, pt.X - winX, (float)(pt.Y - winY - curY), (float)expand);
         }
 
         protected override void WndProc(ref Message m)
@@ -610,7 +895,7 @@ namespace Aevalsistant
                     return;
                 case WM_LBUTTONUP:
                     int target = Hit(m.LParam);
-                    if (Showing && target != ToastArt.HitNone) Clicked?.Invoke(target);
+                    if (Showing && (target == ToastArt.HitHead || target >= 0)) Clicked?.Invoke(target);
                     return;
                 case WM_RBUTTONUP:
                     if (Showing) Dismissed?.Invoke();
@@ -629,6 +914,9 @@ namespace Aevalsistant
                 var tme = new TRACKMOUSEEVENT { cbSize = Marshal.SizeOf(typeof(TRACKMOUSEEVENT)), dwFlags = TME_LEAVE, hwndTrack = Handle };
                 TrackMouseEvent(ref tme);
             }
+            // anywhere on the card opens it, not only the main row
+            ExpandTo(target != ToastArt.HitNone ? 1 : 0);
+            if (resizing) return;   // the next frame draws the new hover as well
             Rebuild();
             if (!animating) Present(curY, curA);
         }
@@ -638,6 +926,7 @@ namespace Aevalsistant
             keys.Disarm();
             dwell.Dispose();
             FreeSurface();
+            frame?.Dispose();
             DestroyHandle();
         }
     }
