@@ -1,0 +1,66 @@
+# Builds Aevalsistant.exe on Windows and publishes it as a GitHub release when a version tag is
+# pushed (git tag v1.2.0 && git push origin v1.2.0). Installed copies pick the release up on their
+# next update check. Pull requests and pushes to main only build and test.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Version from tag
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") { $v = "${{ github.ref_name }}".TrimStart("v") } else { $v = "0.0.0" }
+          "value=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        run: dotnet build Aevalsistant.csproj -c Release -p:Version=${{ steps.version.outputs.value }}
+
+      - name: Test
+        shell: pwsh
+        run: |
+          dotnet build tests/Aevalsistant.Tests.csproj -c Release -p:Version=${{ steps.version.outputs.value }}
+          New-Item -ItemType Directory -Force preview | Out-Null
+          & tests/bin/Release/net48/Aevalsistant.Tests.exe preview
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload card renders
+        uses: actions/upload-artifact@v4
+        with:
+          name: toast-renders
+          path: preview/*.png
+
+      - name: Checksum
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash bin/Release/net48/Aevalsistant.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  Aevalsistant.exe" | Out-File -Encoding ascii -NoNewline bin/Release/net48/Aevalsistant.exe.sha256
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            bin/Release/net48/Aevalsistant.exe `
+            bin/Release/net48/Aevalsistant.exe.sha256 `
+            --title "Aevalsistant ${{ steps.version.outputs.value }}" `
+            --generate-notes
