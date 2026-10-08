@@ -46,6 +46,7 @@ namespace Aevalsistant
             }
             if (args.Length > 0) Previews(args[0]);
             if (args.Length > 0) ToastPreviews(args[0]);
+            if (args.Length > 0) SettingsPreview(args[0]);
             Console.WriteLine($"{passed} passed, {failed} failed");
             return failed == 0 ? 0 : 1;
         }
