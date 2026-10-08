@@ -8,7 +8,7 @@ using System.Text;
 
 namespace Aevalsistant
 {
-    static class Tests
+    static partial class Tests
     {
         static int failed, passed;
 
