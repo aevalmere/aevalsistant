@@ -24,6 +24,8 @@
     <Compile Include="src\**\*.cs" />
     <Compile Remove="tests\**" />
     <EmbeddedResource Include="assets\avatar.png" LogicalName="avatar.png" />
+    <EmbeddedResource Include="assets\sounds\done.wav" LogicalName="done.wav" />
+    <EmbeddedResource Include="assets\sounds\needs-you.wav" LogicalName="needs-you.wav" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="System.Windows.Forms" />

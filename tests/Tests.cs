@@ -33,6 +33,7 @@ namespace Aevalsistant
                 && Updater.ParseTag("nightly") == null, "update: release tags compare against the build version");
             UpdateAssets();
             Easing();
+            PlatformChecks();
             if (args.Length > 0 && args[0] == "--menu") { MenuPreview.Run(); return 0; }
             if (args.Length > 1 && args[0] == "--update-from")
             {
