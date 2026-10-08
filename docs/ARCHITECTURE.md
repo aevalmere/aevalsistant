@@ -1,7 +1,8 @@
-# Aevalsistant: overview and handoff
+# How Aevalsistant works
 
-Status as of 2026-10-08. Version 1.2.0, single exe of about 175 KB. Source intended for the public GitHub repository
-`aevalmere/aevalsistant`, which the built-in updater reads.
+For anyone changing the code. The [README](../README.md) covers what the app does from the user's
+side; this covers how. The exe is about 170 KB with no dependencies, and the built-in updater reads
+releases of `aevalmere/aevalsistant`.
 
 ## What it is
 
@@ -84,21 +85,26 @@ input" command, with no start signal), and Cline (its hook format could not be c
   also on the next launch after a crash.
 - **Updates.** `src/Updater.cs` reads `api.github.com/repos/aevalmere/aevalsistant/releases/latest`
   two minutes after start and every six hours. It downloads the `Aevalsistant.exe` asset and checks
-  it against the `.sha256` asset, then confirms with `AssemblyName` that the file is Aevalsistant at
-  the claimed version. It runs the file once no session is busy. The usual hand-off then replaces
-  the installed copy, and a card reports the new version. Releases come from
-  `.github/workflows/release.yml` on a `v*` tag, which also runs the test suite on a real Windows
-  runner.
+  it against the asset's SHA-256 `digest`, which GitHub computes on upload; a release without one is
+  refused. It then confirms with `AssemblyName` that the file is Aevalsistant at the claimed
+  version, and runs it once no session is busy. The usual hand-off then replaces the installed copy,
+  and a card reports the new version. Releases come from `.github/workflows/build.yml` on a `v*`
+  tag: it builds and tests on a Windows runner, then publishes that exe as the release's only asset.
 - **Install and update.** Double-clicking the exe from anywhere copies it to
   `%LOCALAPPDATA%\Aevalsistant\`, asks a running older copy to quit, and starts the installed copy.
+  Windows will not overwrite an exe that is still running (the old copy may still be exiting, or a
+  `--hook` call may be using it), so the old file is renamed to `Aevalsistant.exe.<ticks>.old`
+  first and deleted on a later start. The browser's download mark is removed from the copy so
+  SmartScreen does not ask again at sign-in. An elevated start ("Run as administrator") is refused,
+  because hook calls from agents running normally cannot reach an elevated tray app.
   "Start with Windows" writes an HKCU Run key. "Remove from this PC" in the tray menu removes the
   hooks, the Run key, and the folder.
 
 ## Code map
 
 Stack: C# on .NET Framework 4.8 (ships with Windows 10 and 11), WinForms for the tray, raw Win32
-through P/Invoke for everything else. No dependencies. Builds on Linux with the .NET 8 SDK and the
-.NET Framework reference assemblies package.
+through P/Invoke for everything else. No dependencies. Builds with the .NET SDK (8 or later) on
+Windows, or on Linux through the .NET Framework reference assemblies package.
 
 | File | Contents |
 |---|---|
@@ -113,10 +119,10 @@ through P/Invoke for everything else. No dependencies. Builds on Linux with the 
 | `src/Power.cs` | Power request and lid-action override |
 | `src/Theme.cs` | Palette, fonts, tray glyph, menu renderer |
 | `src/Updater.cs` | GitHub release check, download, checksum and version verification |
-| `.github/workflows/release.yml` | Windows build and test on every push; tagged pushes publish a release |
 | `src/Native.cs` | Win32 declarations |
-| `tests/` | 98 checks on core logic, installers, adapters, and chat tracking, plus PNG renders of the card; `MenuPreview.cs` drives the real tray menu under Wine |
-| `DESIGN.md` | Design constraints: palette with measured contrast, type, spacing, motion, states |
+| `tests/` | Checks on core logic, installers, adapters, chat tracking, and update asset selection, plus PNG renders of the card; `MenuPreview.cs` drives the real tray menu under Wine |
+| `.github/workflows/build.yml` | Windows build and test on every push; tagged pushes publish a release |
+| `docs/DESIGN.md` | Design constraints: palette with measured contrast, type, spacing, motion, states |
 
 Build: `dotnet build -c Release` gives `bin/Release/net48/Aevalsistant.exe`. Tests:
 `dotnet build -c Release tests`, then run `tests/bin/Release/net48/Aevalsistant.Tests.exe`, under
@@ -124,25 +130,32 @@ mono on Linux, with an optional output folder for preview PNGs.
 
 ## Verification so far
 
-- 99 automated checks pass. They cover:
+- The automated checks pass on Windows 11 (and in CI on every push). They cover:
   - install, re-install, and removal for all seven agents, keeping the user's own hooks
+  - hook paths for user folders with spaces or shell characters, with and without 8.3 names
   - each agent's payload adapter, using the payload shapes from its documentation
   - session and subagent state, out-of-order delivery, interrupts, and staleness
   - the chat tracker
   - transcript parsing, including a real Claude Code transcript
-  - toast layout
-- Updater against a local stand-in for GitHub: a 9.9.0 release is downloaded and verified, a
-  tampered checksum is rejected, and an equal version is ignored. Under Wine, the 9.9.0 build
-  replaced a running 1.1.0 install, cleaned up the update folder, and showed "Aevalsistant updated to
-  9.9.0".
+  - toast layout, and picking the exe and its digest out of a release
+- On Windows 11: the card is invisible to screen capture. With `WDA_EXCLUDEFROMCAPTURE` set, a
+  capture of its area shows only what is behind it; with the flag cleared, the card appears.
+- On Windows 11: the real `Updater.Check` against a local stand-in for GitHub downloads and verifies
+  a 9.9.0 release, throws away a download whose digest does not match, and refuses a release with
+  no digest.
+- On Windows 11: a running exe cannot be overwritten (`IOException`) but can be renamed, which is
+  what the hand-off relies on. Deleting the `Zone.Identifier` stream with `DeleteFileW` removes the
+  download mark and leaves the file.
+- Earlier, under Wine: a 9.9.0 build replaced a running 1.1.0 install through the updater, cleaned
+  up the update folder, and showed "Aevalsistant updated to 9.9.0". Wine does not lock running
+  exes, so this did not exercise the rename above.
 - Under Wine on Linux: first-run install, including hooks written into fake Codex, Gemini, Copilot,
   Cursor, Windsurf, and OpenCode folders (the user's Gemini settings and Cursor hook were kept);
   `--hook` calls from four agents tracked at once in one card; real `--hook` calls producing cards;
   the live list updating; the drop animation recorded frame by frame, Alt+Tab switching foreground from one window
   to another, row hover and click, and the styled tray menu.
-- **Not yet run on real Windows.** Open items to confirm there:
-  - The card is invisible in screenshots and screen sharing. This depends on
-    `SetWindowDisplayAffinity` behaving on a layered window.
+- **Not yet confirmed on real Windows:**
+  - A full install and update cycle with the real tray app running.
   - The lid setting can be written without admin rights.
   - Window detection is correct in Windows Terminal, VS Code, Android Studio, and the Claude desktop
     app, with several of each open.
@@ -160,13 +173,14 @@ mono on Linux, with an optional output folder for preview PNGs.
   not on a specific session inside the desktop app.
 - Sessions that were already open when the hooks were installed or changed must be restarted once.
 - Unsigned: Windows shows "Windows protected your PC" on each new download.
+- Running a newer exe by hand while agents work restarts the tray app right away, so it forgets
+  which sessions are busy until their next prompt. The built-in updater waits for idle instead.
+- A user folder name with a shell character such as `'` or `$`, on a PC with 8.3 names turned off,
+  gives a quoted hook path that bash and cmd run but some PowerShell-based hooks may not.
 
-## Suggested next steps
+## Next steps
 
-1. Run it on the owner's PC with one session in each agent and host app, and work through the open
-   items above.
-2. Create the public repository, push, and tag `v1.2.0`. The first workflow run is also the first time
-   the tests run on real Windows.
-3. Sign the exe once it is stable, to remove the SmartScreen prompt and reduce antivirus flags.
-   Updates the app downloads itself do not get the SmartScreen prompt, because only browser
-   downloads are marked as coming from the internet.
+1. Run it with one session in each agent and host app, and work through the open items above.
+2. Sign the exe, to remove the SmartScreen prompt and reduce antivirus flags. Updates the app
+   downloads itself do not get the SmartScreen prompt, because only browser downloads are marked
+   as coming from the internet.

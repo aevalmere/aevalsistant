@@ -1,0 +1,105 @@
+# Builds and tests Aevalsistant.exe on Windows for every push and pull request. Pushing a tag
+# such as v1.3.0 also publishes a GitHub release whose only asset is that exe. The tag must match
+# <Version> in Aevalsistant.csproj, and CHANGELOG.md must have a section for it. Installed copies
+# pick the release up on their next update check.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $v = (Select-Xml -Path Aevalsistant.csproj -XPath "//Version").Node.InnerText
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "<Version> in Aevalsistant.csproj is '$v'; expected major.minor.patch" }
+          if ($env:REF_TYPE -eq "tag") {
+            if ($env:REF_NAME -ne "v$v") { throw "Tag $env:REF_NAME does not match <Version>$v</Version> in Aevalsistant.csproj" }
+            if (-not (Select-String -Path CHANGELOG.md -Pattern "^## \[$([regex]::Escape($v))\]" -Quiet)) { throw "CHANGELOG.md has no '## [$v]' section" }
+          }
+          "value=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        run: dotnet build Aevalsistant.csproj -c Release
+
+      - name: Test
+        shell: pwsh
+        run: |
+          dotnet build tests/Aevalsistant.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force preview | Out-Null
+          & tests/bin/Release/net48/Aevalsistant.Tests.exe preview
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload card renders
+        uses: actions/upload-artifact@v7
+        with:
+          name: toast-renders
+          path: preview/*.png
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: Aevalsistant-${{ steps.version.outputs.value }}
+          path: bin/Release/net48/Aevalsistant.exe
+          if-no-files-found: error
+
+  # Publishes the exe the build job tested, not a rebuild.
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: Aevalsistant-${{ needs.build.outputs.version }}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          sha=$(sha256sum Aevalsistant.exe | cut -d' ' -f1)
+          awk -v head="## [$VERSION]" '
+            index($0, "## [") == 1 { if (on) exit; on = index($0, head) == 1; next }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ### Download
+
+          Download **Aevalsistant.exe** below and run it. It needs Windows 10 or 11 and nothing else.
+          Copies installed from an earlier release update themselves within six hours.
+
+          The exe is not code-signed yet, so Windows may say "Windows protected your PC" the first
+          time. Choose **More info**, then **Run anyway**.
+
+          SHA-256: \`$sha\`
+          EOF
+          gh release create "$TAG" Aevalsistant.exe --verify-tag --title "Aevalsistant $VERSION" --notes-file notes.md
