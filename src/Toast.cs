@@ -601,6 +601,8 @@ namespace Aevalsistant
         readonly Bitmap avatar = Theme.Resource("avatar.png");
         readonly Stopwatch clock = Stopwatch.StartNew();
         readonly System.Windows.Forms.Timer dwell = new System.Windows.Forms.Timer { Interval = 100 };
+        // A pointer crossing the card on its way somewhere else should not open it.
+        readonly System.Windows.Forms.Timer openDelay = new System.Windows.Forms.Timer { Interval = 150 };
         readonly KeyHook keys = new KeyHook();
         readonly AutoResetEvent wake = new AutoResetEvent(false);
         readonly Thread frames;
@@ -637,6 +639,15 @@ namespace Aevalsistant
             if (!SetWindowDisplayAffinity(Handle, WDA_EXCLUDEFROMCAPTURE)) SetWindowDisplayAffinity(Handle, WDA_MONITOR);
 
             dwell.Tick += (s, e) => Tick();
+            openDelay.Tick += (s, e) =>
+            {
+                openDelay.Stop();
+                if (hover == ToastArt.HitNone) return;
+                ExpandTo(1);
+                if (resizing) return;   // with reduced motion it opened at once, so draw it now
+                Rebuild();
+                if (!animating) Present(curY, curA);
+            };
             keys.AltTab += () => AltTabbed?.Invoke();
             frames = new Thread(FrameLoop) { IsBackground = true, Name = "toast-frames" };
             frames.Start();
@@ -672,6 +683,7 @@ namespace Aevalsistant
             if (phase == Phase.Hidden || phase == Phase.Leaving) return;
             keys.Disarm();
             dwell.Stop();
+            openDelay.Stop();
             Animate(Phase.Leaving, curY, curA, reduced ? curY : FinalY - 10 * scale, 0, reduced ? FadeOnlyExitMs : ExitMs);
         }
 
@@ -914,8 +926,9 @@ namespace Aevalsistant
                 var tme = new TRACKMOUSEEVENT { cbSize = Marshal.SizeOf(typeof(TRACKMOUSEEVENT)), dwFlags = TME_LEAVE, hwndTrack = Handle };
                 TrackMouseEvent(ref tme);
             }
-            // anywhere on the card opens it, not only the main row
-            ExpandTo(target != ToastArt.HitNone ? 1 : 0);
+            // Anywhere on the card opens it, not only the main row, once the pointer settles.
+            if (target == ToastArt.HitNone) { openDelay.Stop(); ExpandTo(0); }
+            else if (entering) openDelay.Start();
             if (resizing) return;   // the next frame draws the new hover as well
             Rebuild();
             if (!animating) Present(curY, curA);
@@ -925,6 +938,7 @@ namespace Aevalsistant
         {
             keys.Disarm();
             dwell.Dispose();
+            openDelay.Dispose();
             FreeSurface();
             frame?.Dispose();
             DestroyHandle();

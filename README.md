@@ -22,13 +22,18 @@ The exe is not code-signed yet, so the first run may show "Windows protected you
 ## Features
 
 - A Windows power request keeps the PC from sleeping until the last agent stops, then lets go.
-  Optionally it keeps the screen on too, or keeps working with the laptop lid closed.
+  Optionally it keeps the screen on too, or keeps a laptop working with the lid closed.
 - The card's top row is the session that just changed. Under it is every other session with its
-  state: needs you, done 3m ago, working 12m, 2 subagents running.
+  state: needs you, done 3m ago, working 12m. Subagents, and sessions that another agent started,
+  are listed under the session they belong to.
+- Hover over the card to read the whole message; it drops down to show it and waits while the
+  mouse is on it.
 - Clicking a row focuses the terminal, editor, or app that session runs in. Alt+Tab while the card
   is showing jumps to the top one.
-- A Claude Code session stays busy while its subagents run, including background subagents that
-  keep going after the main turn ends.
+- Background work stays quiet: a subagent or a session started by another agent finishing does not
+  pop a card, unless you turn that on. Anything that needs you still does.
+- An optional soft chime, one for "finished" and one for "needs you", that stays quiet during
+  presentations and full-screen games.
 - The card never takes keyboard focus, is hidden from screenshots and screen sharing, and only
   counts down while you are at the keyboard.
 - It updates itself from this repository's releases, and waits until no agent is working before
@@ -58,7 +63,7 @@ Chat apps have no hooks. When you switch away from Claude or ChatGPT while a rep
 the app sees the reply's Stop button. It then checks every few seconds until the button is gone and
 shows "Chat finished · Claude". Nothing is read while you are not waiting on a reply. If the reply
 finishes while that app is in front, no notification is shown. Turn this off with "Watch Claude and
-ChatGPT chats" in the tray menu.
+ChatGPT desktop chats" in Settings.
 
 Not tracked:
 
@@ -68,23 +73,40 @@ Not tracked:
 - Aider, which only has a "waiting for input" command and no start signal.
 - Cline, whose hook format could not be confirmed.
 
-## Tray menu
+## Tray menu and Settings
 
-Left- or right-click the tray icon. The icon's eyes are open while it is keeping the PC awake.
+Left- or right-click the tray icon. The icon's eyes are open while agents are working. The menu
+lists your sessions, with what each one started indented under it; click one to jump to its window.
+Anything that needs your attention shows up there too, followed by **Settings** and **Quit**.
 
-| Item | Default | What it does |
+Settings apply as soon as you change them. Options that depend on another one sit under it and
+only appear while it is on:
+
+| Setting | Default | What it does |
 |---|---|---|
-| Stay awake with the lid closed | Off | Sets the power plan's lid action to "Do nothing" while agents work, and puts it back after |
-| Keep the screen on while agents work | Off | Also stops the display from turning off |
+| **Keep awake** | | |
+| Keep the PC awake while agents work | On | Stops Windows from sleeping until the last agent stops. The screen can still turn off |
+| &nbsp;&nbsp;Keep the screen on too | Off | Also stops the display from turning off |
+| &nbsp;&nbsp;Keep working with the lid closed | Off | Laptops only. Sets the lid action to "Do nothing" while agents work, puts it back after, and sleeps a minute after the agents finish if the lid is still shut |
+| **Notifications** | | |
+| Show a card when an agent finishes | On | |
+| &nbsp;&nbsp;Also when background agents finish | Off | Subagents, sessions another agent started, and turns an agent takes on its own |
+| Show a card when an agent needs you | On | Permission prompts and questions |
+| &nbsp;&nbsp;Also when a background agent needs you | On | |
+| Play a sound | On | A soft chime with each card; buttons under it play each one |
+| Expand the card on hover | On | Shows the whole message |
+| Alt+Tab jumps to the agent while the card is up | On | |
+| Card stays up | Normal | Short, Normal, or Long |
+| **Agents** | | |
+| Connect coding agents | On | Adds or removes the hooks in the table above, with a switch for each agent found on this PC |
+| List subagents under their session | On | In the card and the tray menu |
+| Watch Claude and ChatGPT desktop chats | On | Notices replies finishing in the desktop chat apps |
+| **General** | | |
 | Start with Windows | On | Starts the tray app when you sign in |
-| Connect coding agents | On | Adds or removes the hooks in the table above |
-| Watch Claude and ChatGPT chats | On | Notices replies finishing in the desktop chat apps |
 | Update automatically | On | Checks for a new release two minutes after start and every six hours |
-| Check for updates | | Checks right away |
-| Show a test notification | | Shows a card for the most recent session |
-| Remove from this PC | | Undoes everything listed below and deletes the app |
 
-The menu header shows the running version.
+Settings also has **Show a test notification**, **Check for updates**, links to the release notes
+and the issue tracker, and **Remove from this PC**.
 
 ## What it changes on your PC
 
@@ -96,7 +118,7 @@ The menu header shows the running version.
   plan is set to "Do nothing" and restored when the last agent stops, or on the next start after a
   crash.
 
-"Remove from this PC" in the tray menu undoes all of it, including the hooks in every agent's files.
+"Remove from this PC" in Settings undoes all of it, including the hooks in every agent's files.
 
 The only network traffic is the update check: a request to `api.github.com` for this repository's
 latest release, and the download of a newer exe when there is one. Nothing about your sessions,
@@ -111,8 +133,8 @@ restart, a card says which version is now running.
 
 To update by hand, run a newer exe. It replaces the installed copy the same way.
 
-Version 1.1.0 and earlier have no updater. If the tray menu shows no "Check for updates" item,
-download the latest exe once and run it.
+Version 1.1.0 and earlier have no updater. If yours has no "Check for updates" anywhere, download
+the latest exe once and run it.
 
 ## Known limits
 

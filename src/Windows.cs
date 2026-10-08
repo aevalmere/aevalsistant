@@ -41,7 +41,9 @@ namespace Aevalsistant
             ["Hyper.exe"] = "Hyper", ["Tabby.exe"] = "Tabby", ["warp.exe"] = "Warp", ["mintty.exe"] = "Git Bash",
         };
 
-        public struct Found { public IntPtr Window; public int AgentPid; public long AgentStart; public string Host; }
+        public struct Found { public IntPtr Window; public int AgentPid; public long AgentStart; public int OuterPid; public long OuterStart; public string Host; }
+
+        static readonly HashSet<string> AnyAgent = new HashSet<string>(AgentProcesses.Values.SelectMany(n => n), StringComparer.OrdinalIgnoreCase);
 
         public struct Proc { public int Pid; public string Name; }
 
@@ -52,9 +54,18 @@ namespace Aevalsistant
             var found = new Found { Host = "" };
             var chain = Ancestors(Process.GetCurrentProcess().Id);
 
+            // The nearest agent process is this session's own. One further up means another
+            // agent started it (`claude -p` from Claude Code's shell); the tray app nests the
+            // session under that one's if it knows it.
             var names = AgentProcesses.TryGetValue(agent, out var n) ? n : new string[0];
-            foreach (var p in chain)
-                if (names.Contains(p.Name, StringComparer.OrdinalIgnoreCase)) { found.AgentPid = p.Pid; found.AgentStart = StartTime(p.Pid); break; }
+            int own = chain.FindIndex(p => names.Contains(p.Name, StringComparer.OrdinalIgnoreCase));
+            if (own >= 0)
+            {
+                found.AgentPid = chain[own].Pid;
+                found.AgentStart = StartTime(found.AgentPid);
+                var outer = chain.Skip(own + 1).FirstOrDefault(p => AnyAgent.Contains(p.Name));
+                if (outer.Pid != 0) { found.OuterPid = outer.Pid; found.OuterStart = StartTime(outer.Pid); }
+            }
 
             // Classic console window, or a Windows Terminal window via its pseudo-console owner.
             found.Window = ConsoleHostWindow(out bool classic);

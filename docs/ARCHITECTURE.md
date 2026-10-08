@@ -67,6 +67,16 @@ input" command, with no start signal), and Cline (its hook format could not be c
   SubagentStart to SubagentStop; a background subagent keeps the session busy after the parent's turn
   ends. Async hooks can arrive out of order, so prompt and stop events are ordered by the hook
   process start time.
+- **Hierarchy.** The hook client also records the next agent process above the session's own one
+  in the process tree. When that matches another session's agent process, the new session is that
+  one's child: `claude -p` or `codex exec` run from a Claude Code session's shell. `SessionBook.Tree`
+  orders sessions (needs you, done, working) and puts each one's subagents and child sessions one
+  level under it; the card and the tray menu both draw from it.
+- **Background notifications.** A `ToastRequest` is marked `Background` when it comes from a child
+  session, from a second Stop with no prompt in between (the agent took a turn on its own, usually
+  because a background subagent reported back), or from the last background subagent finishing
+  after the turn ended. `Settings.Wants` drops background finishes by default and keeps background
+  "needs you" cards. Each background setting also needs its parent setting on.
 - **Cleanup sweep, every 5 seconds.** It drops a session when its Claude process has exited. It
   marks a session idle when the transcript ends in "[Request interrupted by user]" (Esc skips the
   Stop hook). It also marks a session idle after 45 minutes with no hook event and no transcript
@@ -78,11 +88,21 @@ input" command, with no start signal), and Cline (its hook format could not be c
   "Chat" session and rechecks every 2.5 seconds. Two misses in a row end the session: a notification
   if the app is in the background, a quiet stop if it is in front. Windows that already have a busy
   hook session are skipped, so the desktop app's Code tab is not counted twice. If UI Automation
-  fails to load, chat watching turns itself off and says so in the menu.
+  fails to load, or anything else goes wrong on the watcher thread, chat watching turns itself off
+  and says why in the menu and in Settings.
 - **Keep-awake.** A named power request ("Aevalsistant: AI agents are running", visible in
-  `powercfg /requests`) while any session is busy. Options in the tray menu: keep the screen on, and
-  set the lid action to "Do nothing" while agents run. The lid change is restored afterwards, and
-  also on the next launch after a crash.
+  `powercfg /requests`) while any session is busy, unless the main keep-awake setting is off. Under
+  it: keep the screen on, and, on PCs with a lid, set the lid action to "Do nothing" while agents
+  run. The lid change is restored afterwards, and also on the next launch after a crash. Windows
+  only applies a lid action when the lid moves, so `LidWatcher` follows the lid switch: if it is
+  still shut a minute after the agents finish, the app runs the saved action itself (sleep or
+  hibernate).
+- **Settings.** `src/SettingsWindow.cs` is a themed page of toggles, choices, buttons, and notes;
+  a row added with a parent toggle is indented under it and shown only while it is on. `TrayApp`
+  fills it in and applies each change at once; `settings.ini` stores it.
+- **Sound.** `src/Sound.cs` plays one of two embedded WAVs when a card appears, skipped when
+  Windows reports presentation mode or a full-screen app. `tools/make-sounds.py` synthesizes them,
+  so they carry no license of their own.
 - **Updates.** `src/Updater.cs` reads `api.github.com/repos/aevalmere/aevalsistant/releases/latest`
   two minutes after start and every six hours. It downloads the `Aevalsistant.exe` asset and checks
   it against the asset's SHA-256 `digest`, which GitHub computes on upload; a release without one is
@@ -116,11 +136,14 @@ Windows, or on Linux through the .NET Framework reference assemblies package.
 | `src/Windows.cs` | Process tree walk, window lookup, host app labels, liveness checks, focus |
 | `src/Toast.cs` | Card renderer (GDI+), layered window, compositor-paced drop animation, hit testing, Alt+Tab keyboard hook |
 | `src/TrayApp.cs` | Tray icon and menu, pipe server, notification queue, sweep, keep-awake and lid wiring, hooks file I/O, uninstall |
-| `src/Power.cs` | Power request and lid-action override |
+| `src/Power.cs` | Power request, lid-action override, lid switch watcher, sleep |
+| `src/SettingsWindow.cs` | The Settings window and its owner-drawn rows |
+| `src/Sound.cs` | Notification chimes |
 | `src/Theme.cs` | Palette, fonts, tray glyph, menu renderer |
 | `src/Updater.cs` | GitHub release check, download, checksum and version verification |
+| `tools/make-sounds.py` | Generates `assets/sounds/*.wav` |
 | `src/Native.cs` | Win32 declarations |
-| `tests/` | Checks on core logic, installers, adapters, chat tracking, and update asset selection, plus PNG renders of the card; `MenuPreview.cs` drives the real tray menu under Wine |
+| `tests/` | Checks on core logic, the session tree, installers, adapters, chat tracking, sounds, and update asset selection, plus PNG renders of the card and the Settings window; `MenuPreview.cs` drives the real tray menu under Wine |
 | `.github/workflows/build.yml` | Windows build and test on every push; tagged pushes publish a release |
 | `docs/DESIGN.md` | Design constraints: palette with measured contrast, type, spacing, motion, states |
 

@@ -23,7 +23,7 @@ namespace Aevalsistant
         public string[] Events;
         public Func<string, string, JObj> Entry;   // (event, command) -> hook entry
         public Func<string, string> OwnContent;      // command -> whole file, for HookLayout.Own
-        public string Note = "";   // one-time step the user has to take, shown in the menu
+        public string Note = "";   // one-time step the user has to take, shown in Settings
     }
 
     static class Agents
@@ -57,7 +57,7 @@ namespace Aevalsistant
                 Entry = (ev, cmd) => ev == "SessionEnd" || ev == "Interrupt"
                     ? Obj("type", "command", "command", cmd, "timeout", N(3))
                     : Obj("type", "command", "command", cmd, "timeout", N(10), "async", true),
-                Note = "Codex: run /hooks once to trust the new hooks",
+                Note = "Run /hooks once in Codex to trust the new hooks.",
             },
             new AgentSpec
             {
@@ -248,6 +248,7 @@ namespace Aevalsistant
                     e.Cwd = S("cwd");
                     e.Transcript = S("transcript_path");
                     e.AgentId = S("agent_id");
+                    e.AgentType = S("agent_type");
                     e.LastAssistant = S("last_assistant_message");
                     e.Name = S("hook_event_name");
                     if (e.Name == "PermissionRequest")
@@ -349,6 +350,7 @@ namespace Aevalsistant
                     e.NotificationType = S("notification_type");
                     e.LastAssistant = S("last_assistant_message");
                     e.AgentId = S("agent_id");
+                    e.AgentType = S("agent_type");
                     break;
             }
             // No folder in the payload: the hook runs in the agent's working folder, which is the

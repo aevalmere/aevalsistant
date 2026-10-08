@@ -6,3 +6,4 @@ preview/
 .vs/
 *.user
 *.aevalsistant.bak
+.claude/

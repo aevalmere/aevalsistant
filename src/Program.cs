@@ -200,6 +200,8 @@ namespace Aevalsistant
                 + ",\"hwnd\":" + t.Window.ToInt64()
                 + ",\"pid\":" + t.AgentPid
                 + ",\"pidStart\":" + t.AgentStart
+                + ",\"outer\":" + t.OuterPid
+                + ",\"outerStart\":" + t.OuterStart
                 + ",\"raw\":" + Json.Quote(raw) + "}";
             App.Send(envelope);
         }

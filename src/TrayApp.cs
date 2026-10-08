@@ -39,6 +39,15 @@ namespace Aevalsistant
         volatile HashSet<long> busyWindows = new HashSet<long>();   // read by the chat watcher thread
         Icon trayIcon;
         bool? trayAwake;
+        readonly bool hasLid = LidAction.HasLid();
+        readonly LidWatcher lid;
+        // With the lid shut when the agents finish, the plan's own lid action (sleep) only runs
+        // once the lid moves again, so the app runs it a minute later if nothing restarted.
+        readonly System.Windows.Forms.Timer lidSleep = new System.Windows.Forms.Timer { Interval = 60 * 1000 };
+        uint? lidActionDue;
+        SettingsWindow settingsWindow;
+        Note updateNote, lidNote, chatNote;
+        readonly Dictionary<string, Toggle> agentToggles = new Dictionary<string, Toggle>();
 
         public TrayApp()
         {
@@ -46,7 +55,7 @@ namespace Aevalsistant
                 SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
             ui = SynchronizationContext.Current;
 
-            toast = new ToastWindow();
+            toast = new ToastWindow { ExpandOnHover = settings.ExpandOnHover };
             toast.Clicked += Activate;
             toast.AltTabbed += () => Activate(ToastArt.HitHead);
             toast.Expired += () => { pending.Clear(); toast.Hide(); };
@@ -54,6 +63,12 @@ namespace Aevalsistant
 
             // Repair a lid override left behind by a crash or power loss.
             if (settings.LidSaved.Length > 0 && LidAction.Restore(settings.LidSaved)) { settings.LidSaved = ""; Save(); }
+            if (hasLid)
+            {
+                lid = new LidWatcher();
+                lid.Changed += closed => { if (!closed) { lidSleep.Stop(); lidActionDue = null; } };
+            }
+            lidSleep.Tick += (s, e) => SleepIfLidStillShut();
 
             if (settings.Hooks) SyncAgents(true);
             if (settings.Chats) StartChats();
@@ -108,7 +123,7 @@ namespace Aevalsistant
                 Enqueue(new ToastRequest
                 {
                     Kind = ToastKind.Info, Title = "Aevalsistant is running",
-                    Detail = "Restart open Claude Code sessions once so they report here.",
+                    Detail = "Restart open Claude Code sessions once so they report here. Settings are in the tray menu, next to the clock.",
                 });
             }
         }
@@ -185,6 +200,12 @@ namespace Aevalsistant
 
         void Enqueue(ToastRequest req)
         {
+            if (!settings.Wants(req))
+            {
+                // No card for this, but the list under a card already showing stays current.
+                if (toast.Showing) ShowTop(false);
+                return;
+            }
             if (req.SessionId != null) pending.RemoveAll(p => p.SessionId == req.SessionId);
             pending.Add(req);
             if (req.WantsSnippet)
@@ -197,11 +218,14 @@ namespace Aevalsistant
                     req.Detail = Snippet.Clean(SafeLastText(book.Get(req.SessionId)?.Transcript));
                     if (req.Detail.Length == 0) req.Detail = "Ready for your next prompt.";
                     req.WantsSnippet = false;
-                    if (pending.Contains(req)) ShowTop();
+                    if (!pending.Contains(req)) return;
+                    if (settings.Sound) Sound.Play(req.Kind);
+                    ShowTop();
                 };
                 t.Start();
                 return;
             }
+            if (settings.Sound) Sound.Play(req.Kind);
             ShowTop();
         }
 
@@ -217,29 +241,30 @@ namespace Aevalsistant
             var c = new ToastContent
             {
                 Title = top.Title, Detail = top.Detail, Kind = top.Kind, Host = top.Host ?? "",
-                Keycap = CanJump(top.SessionId, top.Hwnd),
+                Keycap = settings.AltTab && CanJump(top.SessionId, top.Hwnd),
             };
-            var others = book.All.Where(x => x.Id != top.SessionId)
-                .OrderBy(x => Status.State(x) == RowState.NeedsYou ? 0 : Status.State(x) == RowState.Done ? 1 : 2)
-                .ThenByDescending(x => x.LastEvent)
-                .ToList();
+            var tree = book.Tree(top.SessionId, settings.ShowChildren);
             var now = DateTime.UtcNow;
-            foreach (var x in others.Take(ToastArt.MaxRows))
-            {
-                c.Rows.Add(new ToastRow
-                {
-                    SessionId = x.Id, Hwnd = x.Hwnd, Name = x.Project, Host = x.Where,
-                    State = Status.State(x),
-                    Status = Status.Text(x, now),
-                });
-            }
-            if (others.Count > ToastArt.MaxRows)
-                c.Overflow = (others.Count - ToastArt.MaxRows) + " more in the tray menu";
+            foreach (var r in tree.Take(ToastArt.MaxRows)) c.Rows.Add(RowFor(r, now));
+            if (tree.Count > ToastArt.MaxRows)
+                c.Overflow = (tree.Count - ToastArt.MaxRows) + " more in the tray menu";
 
             shown = c;
-            double seconds = !restartCountdown ? -1 : top.Kind == ToastKind.NeedsYou ? 10 : top.Kind == ToastKind.Info ? 5 : 8;
-            toast.Show(c, seconds);
+            toast.Show(c, restartCountdown ? settings.Seconds(top.Kind) : -1);
         }
+
+        // A subagent row focuses its session's window, since that is where it runs.
+        static ToastRow RowFor(TreeRow r, DateTime now) => r.Subagent != null
+            ? new ToastRow
+            {
+                SessionId = r.Session.Id, Hwnd = r.Session.Hwnd, Depth = r.Depth, State = RowState.Working,
+                Name = r.Subagent.Type.Length > 0 ? r.Subagent.Type : "subagent", Status = Status.Text(r.Subagent, now),
+            }
+            : new ToastRow
+            {
+                SessionId = r.Session.Id, Hwnd = r.Session.Hwnd, Depth = r.Depth, State = Status.State(r.Session),
+                Name = r.Session.Project, Host = r.Session.Where, Status = Status.Text(r.Session, now),
+            };
 
         void Withdraw(string sessionId)
         {
@@ -320,6 +345,7 @@ namespace Aevalsistant
                 chats?.Dispose();   // its foreground hook would otherwise call into a collected delegate
                 chats = null;
                 chatProblem = "Chat watching stopped: " + reason;
+                RefreshSettingsNotes();
             };
         }
 
@@ -355,7 +381,9 @@ namespace Aevalsistant
                     updateStatus = "Up to date (" + current + ")";
                     if (manual) Enqueue(new ToastRequest { Kind = ToastKind.Info, Title = "Aevalsistant is up to date", Detail = "Version " + current + " is the latest release." });
                 }
+                RefreshSettingsNotes();
             }, null));
+            RefreshSettingsNotes();
         }
 
         // Restarting forgets which sessions are working, so an update waits until none are.
@@ -374,17 +402,35 @@ namespace Aevalsistant
             TryApplyUpdate();
             int working = book.BusyCount;
             bool on = working > 0;
-            awake.Set(on, on && settings.DisplayOn);
+            bool keep = on && settings.KeepAwake;
+            awake.Set(keep, keep && settings.DisplayOn);
 
-            bool wantLid = on && settings.LidAwake;
-            if (wantLid && settings.LidSaved.Length == 0)
+            bool wantLid = keep && settings.LidAwake && hasLid;
+            if (wantLid)
             {
-                string saved = LidAction.Override(out lidProblem);
-                if (saved != null) { settings.LidSaved = saved; Save(); }
+                lidSleep.Stop();
+                lidActionDue = null;
+                if (settings.LidSaved.Length == 0)
+                {
+                    string saved = LidAction.Override(out lidProblem);
+                    if (saved != null) { settings.LidSaved = saved; Save(); }
+                    RefreshSettingsNotes();
+                }
             }
-            else if (!wantLid && settings.LidSaved.Length > 0)
+            else if (settings.LidSaved.Length > 0)
             {
-                if (LidAction.Restore(settings.LidSaved)) { settings.LidSaved = ""; Save(); }
+                string saved = settings.LidSaved;
+                if (LidAction.Restore(saved))
+                {
+                    settings.LidSaved = "";
+                    Save();
+                    if (!on && lid?.Closed == true)
+                    {
+                        lidActionDue = LidAction.SavedAction(saved, Battery.OnBattery());
+                        lidSleep.Stop();
+                        if (lidActionDue == 1 || lidActionDue == 2) lidSleep.Start();
+                    }
+                }
             }
 
             if (trayAwake != on)
@@ -396,8 +442,21 @@ namespace Aevalsistant
                 tray.Icon = trayIcon;
                 if (old != null) { Native.DestroyIcon(old.Handle); old.Dispose(); }
             }
-            string tip = on ? "Aevalsistant: keeping awake, " + Plural.Agents(working) + " working" : "Aevalsistant: idle, sleep allowed";
+            string tip = keep ? "Aevalsistant: keeping awake, " + Plural.Agents(working) + " working"
+                : on ? "Aevalsistant: " + Plural.Agents(working) + " working, sleep allowed"
+                : "Aevalsistant: idle, sleep allowed";
             tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
+        }
+
+        // Sleep or hibernate, whichever closing the lid is set to do, if the lid is still shut
+        // and nothing started working again in the meantime.
+        void SleepIfLidStillShut()
+        {
+            lidSleep.Stop();
+            uint? action = lidActionDue;
+            lidActionDue = null;
+            if (action == null || book.BusyCount > 0 || lid?.Closed != true) return;
+            Battery.Suspend(hibernate: action == 2);
         }
 
         // ---- menu ---------------------------------------------------------------------
@@ -419,58 +478,43 @@ namespace Aevalsistant
 
             int working = book.BusyCount;
             menu.Items.Add(Label("Aevalsistant " + Updater.Current.ToString(3), "header", bold: true));
-            menu.Items.Add(Label(working > 0 ? "Keeping awake: " + Plural.Agents(working) + " working" : "Idle. Sleep is allowed.", "status"));
+            menu.Items.Add(Label(working == 0 ? "Idle. Sleep is allowed."
+                : settings.KeepAwake ? "Keeping awake: " + Plural.Agents(working) + " working"
+                : Plural.Agents(working) + " working. Sleep is allowed.", "status"));
             menu.Items.Add(new ToolStripSeparator());
 
-            var sessions = book.All.Take(8).ToList();
-            if (sessions.Count == 0) menu.Items.Add(Label("No Claude Code sessions yet", "status"));
-            foreach (var s in sessions)
+            // Every session, with what it started indented under it.
+            const int MaxItems = 14;
+            var tree = book.Tree(null, settings.ShowChildren);
+            if (tree.Count == 0) menu.Items.Add(Label("No agent sessions yet", "status"));
+            var now = DateTime.UtcNow;
+            foreach (var r in tree.Take(MaxItems))
             {
-                var rs = Status.State(s);
-                string state = Status.Text(s, DateTime.UtcNow);
-                Color color = rs == RowState.NeedsYou ? Theme.Blush : rs == RowState.Working ? Theme.Slate : Theme.SlateSoft;
-                var item = new ToolStripMenuItem(s.Where.Length > 0 ? s.Project + "  \u00B7  " + s.Where : s.Project)
+                var row = RowFor(r, now);
+                Color color = row.State == RowState.NeedsYou ? Theme.Blush : row.State == RowState.Working ? Theme.Slate : Theme.SlateSoft;
+                string text = row.Host.Length > 0 ? row.Name + "  \u00B7  " + row.Host : row.Name;
+                var item = new ToolStripMenuItem(r.Depth > 0 ? "\u2003\u2003" + text : text)
                 {
-                    ShortcutKeyDisplayString = state,
-                    Image = Theme.Dot(dot, color, rs == RowState.Working),
-                    Enabled = CanFocus(s.Id, s.Hwnd),
-                    ToolTipText = s.Cwd.Length > 0 ? s.Cwd : s.Project,
+                    ShortcutKeyDisplayString = row.Status,
+                    Image = Theme.Dot(r.Depth > 0 ? (int)Math.Round(dot * 0.8) : dot, color, row.State == RowState.Working),
+                    Enabled = CanFocus(row.SessionId, row.Hwnd),
+                    ToolTipText = r.Subagent == null && r.Session.Cwd.Length > 0 ? r.Session.Cwd : row.Name,
                 };
-                string id = s.Id;
-                long hwnd = s.Hwnd;
+                string id = row.SessionId;
+                long hwnd = row.Hwnd;
                 item.Click += (o, e) => FocusTarget(id, hwnd);
                 menu.Items.Add(item);
             }
+            if (tree.Count > MaxItems) menu.Items.Add(Label((tree.Count - MaxItems) + " more", "status"));
             menu.Items.Add(new ToolStripSeparator());
 
-            menu.Items.Add(Toggle("Stay awake with the lid closed", settings.LidAwake, v => { settings.LidAwake = v; lidProblem = null; Save(); RefreshState(); }));
-            if (lidProblem != null) menu.Items.Add(Label(lidProblem, "status"));
-            menu.Items.Add(Toggle("Keep the screen on while agents work", settings.DisplayOn, v => { settings.DisplayOn = v; Save(); RefreshState(); }));
-            menu.Items.Add(Toggle("Start with Windows", settings.Startup, v => { settings.Startup = v; Save(); SetStartup(v); }));
-
-            var connected = Agents.All.Where(AgentConnected).ToList();
-            menu.Items.Add(Toggle("Connect coding agents", settings.Hooks && connected.Count > 0, v => { settings.Hooks = v; Save(); SyncAgents(v); }));
-            if (settings.Hooks && connected.Count > 0)
-                menu.Items.Add(Label("Connected: " + string.Join(", ", connected.Select(a => a.Name)), "status"));
+            // Things that need doing stay visible here; everything else lives in Settings.
             foreach (var problem in agentProblems.Values) menu.Items.Add(Label(problem, "status"));
-            menu.Items.Add(Toggle("Watch Claude and ChatGPT chats", settings.Chats, v =>
-            {
-                settings.Chats = v;
-                Save();
-                if (v) StartChats(); else StopChats();
-            }));
+            if (lidProblem != null) menu.Items.Add(Label(lidProblem, "status"));
             if (chatProblem != null) menu.Items.Add(Label(chatProblem, "status"));
             if (justConnected.Count > 0) menu.Items.Add(Label("Restart open agent sessions once to connect them", "status"));
-            foreach (var a in connected.Where(a => justConnected.Contains(a.Id) && a.Note.Length > 0))
-                menu.Items.Add(Label(a.Note, "status"));
-            menu.Items.Add(new ToolStripSeparator());
-
-            menu.Items.Add(Toggle("Update automatically", settings.AutoUpdate, v => { settings.AutoUpdate = v; Save(); }));
-            menu.Items.Add(Command("Check for updates", () => CheckForUpdates(manual: true)));
-            if (updateStatus != null) menu.Items.Add(Label(updateStatus, "status"));
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(Command("Show a test notification", TestToast));
-            menu.Items.Add(Command("Remove from this PC", Uninstall));
+            if (pendingUpdate != null) menu.Items.Add(Label(updateStatus, "status"));
+            menu.Items.Add(Command("Settings", OpenSettings));
             menu.Items.Add(Command("Quit", Quit));
         }
 
@@ -483,13 +527,6 @@ namespace Aevalsistant
             return item;
         }
 
-        static ToolStripMenuItem Toggle(string text, bool on, Action<bool> set)
-        {
-            var item = new ToolStripMenuItem(text) { Checked = on };
-            item.Click += (s, e) => set(!on);
-            return item;
-        }
-
         static ToolStripMenuItem Command(string text, Action run)
         {
             var item = new ToolStripMenuItem(text);
@@ -497,15 +534,137 @@ namespace Aevalsistant
             return item;
         }
 
+        // Shown even with finish cards turned off, since asking for it is the point. The long
+        // message shows off the hover expansion.
         void TestToast()
         {
             var s = book.All.FirstOrDefault(x => CanFocus(x.Id, x.Hwnd));
-            Enqueue(new ToastRequest
+            var req = new ToastRequest
             {
                 SessionId = s?.Id, Hwnd = s?.Hwnd ?? 0, Host = s?.Where ?? "", Kind = ToastKind.Done,
                 Title = s != null ? s.Project + " finished" : "Test notification",
-                Detail = s != null ? "Click it, or press Alt+Tab, to jump to that window." : "Start a Claude Code session to jump to it from here.",
+                Detail = (s != null ? "Click this card, or press Alt+Tab while it is up, to jump to that window." : "Start an agent session to jump to it from here.")
+                    + " Hover over a card to read its whole message: long replies drop down to several lines, and the card waits while the mouse is on it.",
+            };
+            if (req.SessionId != null) pending.RemoveAll(p => p.SessionId == req.SessionId);
+            pending.Add(req);
+            if (settings.Sound) Sound.Play(req.Kind);
+            ShowTop();
+        }
+
+        // ---- settings window --------------------------------------------------------------
+
+        // Options that only matter while another one is on sit under it and hide with it.
+        void OpenSettings()
+        {
+            if (settingsWindow != null)
+            {
+                if (settingsWindow.WindowState == FormWindowState.Minimized) settingsWindow.WindowState = FormWindowState.Normal;
+                settingsWindow.Activate();
+                return;
+            }
+            var w = new SettingsWindow();
+
+            w.Section("Keep awake");
+            var keep = w.AddToggle("Keep the PC awake while agents work",
+                "Windows won't sleep until the last agent stops. The screen can still turn off on its usual timer.",
+                settings.KeepAwake, v => { settings.KeepAwake = v; Save(); RefreshState(); });
+            w.AddToggle("Keep the screen on too", null, settings.DisplayOn, v => { settings.DisplayOn = v; Save(); RefreshState(); }, keep);
+            if (hasLid)
+            {
+                var lidToggle = w.AddToggle("Keep working with the lid closed", "When the agents finish with the lid shut, the laptop goes to sleep.",
+                    settings.LidAwake, v => { settings.LidAwake = v; lidProblem = null; Save(); RefreshState(); RefreshSettingsNotes(); }, keep);
+                lidNote = w.AddNote(lidProblem ?? "", lidToggle);
+            }
+
+            w.Section("Notifications");
+            var done = w.AddToggle("Show a card when an agent finishes", null, settings.NotifyDone, v => { settings.NotifyDone = v; Save(); });
+            w.AddToggle("Also when background agents finish", "Subagents, and agents that another agent started.",
+                settings.NotifyBackgroundDone, v => { settings.NotifyBackgroundDone = v; Save(); }, done);
+            var asks = w.AddToggle("Show a card when an agent needs you", null, settings.NotifyNeedsYou, v => { settings.NotifyNeedsYou = v; Save(); });
+            w.AddToggle("Also when a background agent needs you", null,
+                settings.NotifyBackgroundNeedsYou, v => { settings.NotifyBackgroundNeedsYou = v; Save(); }, asks);
+            var sound = w.AddToggle("Play a sound", "A soft chime with each card. Quiet during presentations and full-screen games.",
+                settings.Sound, v => { settings.Sound = v; Save(); });
+            w.AddButton("Finished", () => Sound.Play(ToastKind.Done), sound);
+            w.AddButton("Needs you", () => Sound.Play(ToastKind.NeedsYou), sound);
+            w.AddToggle("Expand the card on hover to show the whole message", null,
+                settings.ExpandOnHover, v => { settings.ExpandOnHover = v; toast.ExpandOnHover = v; Save(); });
+            w.AddToggle("Alt+Tab jumps to the agent while the card is up", null, settings.AltTab, v => { settings.AltTab = v; Save(); });
+            w.AddChoice("Card stays up", new[] { "Short", "Normal", "Long" }, settings.CardTime, i => { settings.CardTime = i; Save(); });
+            w.AddButton("Show a test notification", TestToast);
+
+            w.Section("Agents");
+            var hooks = w.AddToggle("Connect coding agents", "Adds Aevalsistant to each agent's hook settings. Restart open sessions once after a change.",
+                settings.Hooks, v => { settings.Hooks = v; Save(); SyncAgents(v); RefreshSettingsNotes(); });
+            agentToggles.Clear();
+            foreach (var a in Agents.All.Where(AgentPresent))
+            {
+                string id = a.Id;
+                agentToggles[id] = w.AddToggle(a.Name, AgentStatus(a), !settings.AgentsOff.Contains(id), v =>
+                {
+                    if (v) settings.AgentsOff.Remove(id); else settings.AgentsOff.Add(id);
+                    Save();
+                    SyncAgents(settings.Hooks);
+                    RefreshSettingsNotes();
+                }, hooks);
+            }
+            w.AddToggle("List subagents under their session", "In the card and the tray menu.", settings.ShowChildren, v =>
+            {
+                settings.ShowChildren = v;
+                Save();
+                if (toast.Showing) ShowTop(false);
             });
+            var chat = w.AddToggle("Watch Claude and ChatGPT desktop chats", "Notices a reply finishing while you are in another app.", settings.Chats, v =>
+            {
+                settings.Chats = v;
+                chatProblem = null;
+                Save();
+                if (v) StartChats(); else StopChats();
+                RefreshSettingsNotes();
+            });
+            chatNote = w.AddNote(chatProblem ?? "", chat);
+
+            w.Section("General");
+            w.AddToggle("Start with Windows", null, settings.Startup, v => { settings.Startup = v; Save(); SetStartup(v); });
+            w.AddToggle("Update automatically", "Checks this app's GitHub releases two minutes after start and every six hours.",
+                settings.AutoUpdate, v => { settings.AutoUpdate = v; Save(); });
+            w.AddButton("Check for updates", () => CheckForUpdates(manual: true));
+            updateNote = w.AddNote(UpdateLine());
+            w.AddLink("Release notes", "https://github.com/" + Updater.Repo + "/releases");
+            w.AddLink("Report a problem", "https://github.com/" + Updater.Repo + "/issues/new/choose");
+            w.AddButton("Remove from this PC", Uninstall, danger: true);
+
+            w.FormClosed += (s, e) =>
+            {
+                settingsWindow = null;
+                updateNote = lidNote = chatNote = null;
+                agentToggles.Clear();
+            };
+            settingsWindow = w;
+            w.Show();
+            w.Activate();
+        }
+
+        string UpdateLine() => updateStatus ?? "Version " + Updater.Current.ToString(3);
+
+        string AgentStatus(AgentSpec a)
+        {
+            if (agentProblems.TryGetValue(a.Id, out var problem)) return problem;
+            if (!settings.Hooks || settings.AgentsOff.Contains(a.Id)) return "Not connected";
+            if (!AgentConnected(a)) return "Not connected yet";
+            return justConnected.Contains(a.Id) && a.Note.Length > 0 ? "Connected. " + a.Note : "Connected";
+        }
+
+        // Status lines in an open Settings window follow what happens elsewhere.
+        void RefreshSettingsNotes()
+        {
+            if (settingsWindow == null) return;
+            if (updateNote != null) updateNote.Text = UpdateLine();
+            if (lidNote != null) lidNote.Text = lidProblem ?? "";
+            if (chatNote != null) chatNote.Text = chatProblem ?? "";
+            foreach (var a in Agents.All)
+                if (agentToggles.TryGetValue(a.Id, out var t)) t.Note = AgentStatus(a);
         }
 
         // ---- install surface ----------------------------------------------------------
@@ -547,7 +706,7 @@ namespace Aevalsistant
                 try
                 {
                     string text = File.Exists(path) ? File.ReadAllText(path) : null;
-                    bool add = install && AgentPresent(a);
+                    bool add = install && AgentPresent(a) && !settings.AgentsOff.Contains(a.Id);
                     if (text == null && !add) { agentProblems.Remove(a.Id); continue; }
                     string next = Agents.Apply(a, text, add ? Agents.CommandFor(a, hookCommand) : null, out bool changed);
                     if (changed)
@@ -598,7 +757,7 @@ namespace Aevalsistant
 
         void Uninstall()
         {
-            var answer = MessageBox.Show(
+            var answer = MessageBox.Show(settingsWindow,
                 "Remove Aevalsistant? Its hooks in every coding agent, its startup entry, and its folder in AppData will be deleted.\n\n"
                 + "Restart open agent sessions afterwards so they stop calling it.",
                 "Aevalsistant", MessageBoxButtons.OKCancel, MessageBoxIcon.None, MessageBoxDefaultButton.Button2);
@@ -626,6 +785,9 @@ namespace Aevalsistant
             updateTimer.Stop();
             if (settings.LidSaved.Length > 0 && LidAction.Restore(settings.LidSaved)) { settings.LidSaved = ""; }
             if (Directory.Exists(App.Home)) Save();
+            settingsWindow?.Close();
+            lidSleep.Dispose();
+            lid?.Dispose();
             chats?.Dispose();
             awake.Dispose();
             tray.Visible = false;

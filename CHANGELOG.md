@@ -5,6 +5,31 @@ Each release's section here becomes its notes on the
 [semantic versioning](https://semver.org): the patch number for fixes, the minor number for new
 features, the major number for changes that need you to do something.
 
+## [1.4.0] - 2026-10-08
+
+### New
+
+- A Settings window, opened from the tray menu. Options that only matter while another one is on
+  sit under it and hide while it is off. Keep-awake now has a main switch, with "keep the screen on
+  too" and "keep working with the lid closed" under it; the lid option only appears on PCs with a lid.
+- Hover over a card to read the whole message. It drops down smoothly to show up to eight lines,
+  and waits while the mouse is on it.
+- Subagents, and agent sessions that another agent started (such as `claude -p` run from a Claude
+  Code session), are listed under their session in the card and the tray menu.
+- Work in the background no longer pops a card when it finishes: subagents, sessions another agent
+  started, and turns an agent takes on its own after a background subagent reports back. A
+  background agent that needs you still shows one. Both can be changed in Settings.
+- An optional chime when a card appears, one for "finished" and one for "needs you". It stays quiet
+  during presentations and full-screen games.
+- New settings: which cards show, sound, hover expansion, Alt+Tab, how long cards stay up, each
+  coding agent on its own, and whether to list subagents.
+- With "keep working with the lid closed" on, a laptop whose lid is still shut a minute after the
+  agents finish goes to sleep, instead of staying on until its sleep timer runs out.
+
+### Changed
+
+- The tray menu is shorter: your sessions, anything that needs attention, Settings, and Quit.
+
 ## [1.3.0] - 2026-10-08
 
 The first public release. Earlier 1.x builds were private.

@@ -12,6 +12,15 @@ namespace Aevalsistant
     enum ToastKind { Done, NeedsYou, Info }
     enum RowState { Working, Done, NeedsYou }
 
+    // A subagent that started and has not stopped. Background subagents keep running after the
+    // parent's turn ends.
+    sealed class Subagent
+    {
+        public string Type = "";   // "Explore", "general-purpose"...; empty when the agent does not say
+        public DateTime Started;
+        public DateTime Seen;      // last sign of life: its start, or a write to its transcript
+    }
+
     sealed class Session
     {
         public string Id;
@@ -20,6 +29,11 @@ namespace Aevalsistant
         public long Hwnd;
         public int Pid;
         public long PidStart;
+        // The agent process that started this session's agent, when one did: a Claude Code
+        // session running `claude -p` or `codex exec` in its shell. Matched against other
+        // sessions' Pid to nest this one under its parent.
+        public int OuterPid;
+        public long OuterStart;
         public AgentState State = AgentState.Waiting;
         public bool Blocked;              // a permission prompt is open
         public bool NotifiedSincePrompt;
@@ -33,9 +47,7 @@ namespace Aevalsistant
         public string PendingText = "";   // the agent's last reply, for agents that send it before Stop
         public string Where => Agents.Where(Agent, Host);
         public DateTime WorkingSince;     // when the current turn started
-        // Subagents that started and have not stopped, by agent id, with their last sign of life.
-        // Background subagents keep running after the parent's turn ends.
-        public readonly Dictionary<string, DateTime> Subagents = new Dictionary<string, DateTime>();
+        public readonly Dictionary<string, Subagent> Subagents = new Dictionary<string, Subagent>();
         readonly HashSet<string> stoppedEarly = new HashSet<string>();   // async SubagentStop that beat its Start
         public bool Busy => State == AgentState.Working || Subagents.Count > 0;
 
@@ -45,14 +57,17 @@ namespace Aevalsistant
                 ? Path.Combine(Transcript.Substring(0, Transcript.Length - 6), "subagents", "agent-" + agentId + ".jsonl")
                 : "";
 
-        public void SubagentStarted(string id, DateTime now)
+        public void SubagentStarted(string id, string type, DateTime now)
         {
-            if (!stoppedEarly.Remove(id)) Subagents[id] = now;
+            if (!stoppedEarly.Remove(id)) Subagents[id] = new Subagent { Type = type ?? "", Started = now, Seen = now };
         }
 
-        public void SubagentStopped(string id)
+        // True when this was the last one running.
+        public bool SubagentStopped(string id)
         {
-            if (!Subagents.Remove(id)) stoppedEarly.Add(id);
+            if (Subagents.Remove(id)) return Subagents.Count == 0;
+            stoppedEarly.Add(id);
+            return false;
         }
 
         // Last folder of the working directory. Split by hand so Windows paths behave the
@@ -85,12 +100,15 @@ namespace Aevalsistant
         public long At;   // when the hook process started; async hooks can arrive out of order
         public string Host = "";
         public string AgentId = "";
+        public string AgentType = "";   // a subagent's kind, from SubagentStart
         public string Agent = "claude";
         public string Label = "";
         public bool CwdGuessed;
+        public int OuterPid;
+        public long OuterStart;
 
         // The envelope the --hook client sends:
-        // {"t":..,"agent":"codex","event":"","pwd":"..","host":"..","hwnd":..,"pid":..,"pidStart":..,"raw":"<stdin>"}
+        // {"t":..,"agent":"codex","event":"","pwd":"..","host":"..","hwnd":..,"pid":..,"pidStart":..,"outer":..,"outerStart":..,"raw":"<stdin>"}
         public static HookEvent FromEnvelope(string text)
         {
             if (!Json.TryParse(text, out var env) || !(env is JObj o)) return null;
@@ -104,6 +122,8 @@ namespace Aevalsistant
                 PidStart = (o["pidStart"] as JNum)?.AsLong() ?? 0,
                 At = (o["t"] as JNum)?.AsLong() ?? 0,
                 Host = o.Str("host") ?? "",
+                OuterPid = (int)((o["outer"] as JNum)?.AsLong() ?? 0),
+                OuterStart = (o["outerStart"] as JNum)?.AsLong() ?? 0,
             };
             Agents.Normalize(e.Agent, h, e, o.Str("pwd"));
             return e.SessionId.Length == 0 || e.Name.Length == 0 ? null : e;
@@ -119,6 +139,11 @@ namespace Aevalsistant
         public string Title;
         public string Detail;
         public bool WantsSnippet;  // fill Detail from the transcript just before showing
+        // Came from work running in the background rather than from your own prompt: a session
+        // that another agent started, a turn the agent took on its own after a background
+        // subagent reported back, or the last background subagent finishing. Settings decide
+        // whether these show a card.
+        public bool Background;
     }
 
     sealed class SessionBook
@@ -131,6 +156,44 @@ namespace Aevalsistant
         public IEnumerable<Session> All => map.Values.OrderByDescending(s => s.LastEvent);
         public int BusyCount => map.Values.Count(s => s.Busy);
         public Session Get(string id) => id != null && map.TryGetValue(id, out var s) ? s : null;
+
+        // Sessions in display order, needs-you first, then done, then working. With nest on, each
+        // is followed by what it started: its subagents, then sessions its agent started (and
+        // theirs), one level in. headId is left out of the list because the card shows it above,
+        // but its own children lead the list.
+        public List<TreeRow> Tree(string headId, bool nest)
+        {
+            int Rank(Session s) => Status.State(s) == RowState.NeedsYou ? 0 : Status.State(s) == RowState.Done ? 1 : 2;
+            Session Root(Session s)
+            {
+                for (int hops = 0; hops < 8; hops++) { var p = ParentOf(s); if (p == null) break; s = p; }
+                return s;
+            }
+            var ordered = map.Values.OrderBy(Rank).ThenByDescending(s => s.LastEvent).ToList();
+            var rows = new List<TreeRow>();
+            void Children(Session parent)
+            {
+                foreach (var kv in parent.Subagents.OrderBy(kv => kv.Value.Started))
+                    rows.Add(new TreeRow { Session = parent, SubagentId = kv.Key, Subagent = kv.Value, Depth = 1 });
+                foreach (var c in ordered)
+                    if (c != parent && c.Id != headId && Root(c) == parent)
+                        rows.Add(new TreeRow { Session = c, Depth = 1 });
+            }
+            var head = Get(headId);
+            if (nest && head != null) Children(head);
+            foreach (var s in ordered)
+            {
+                if (s.Id == headId || (nest && Root(s) != s)) continue;
+                rows.Add(new TreeRow { Session = s });
+                if (nest) Children(s);
+            }
+            return rows;
+        }
+
+        // The session whose agent process started this one's, if this app knows it.
+        public Session ParentOf(Session s) =>
+            s == null || s.OuterPid == 0 ? null
+            : map.Values.FirstOrDefault(p => p != s && p.Pid == s.OuterPid && (p.PidStart == 0 || s.OuterStart == 0 || p.PidStart == s.OuterStart));
 
         public ToastRequest Apply(HookEvent e, DateTime now)
         {
@@ -148,8 +211,10 @@ namespace Aevalsistant
             if (e.Agent.Length > 0) s.Agent = e.Agent;
             if (e.Label.Length > 0) s.Label = e.Label;
             if (e.Pid != 0) { s.Pid = e.Pid; s.PidStart = e.PidStart; }
+            if (e.OuterPid != 0) { s.OuterPid = e.OuterPid; s.OuterStart = e.OuterStart; }
             s.LastEvent = now;
             s.LastActivity = now;
+            bool child = ParentOf(s) != null;
 
             bool isPrompt = e.Name == "UserPromptSubmit";
             bool isStop = e.Name == "Stop" || e.Name == "StopFailure" || e.Name == "Interrupt";
@@ -176,12 +241,19 @@ namespace Aevalsistant
                     return null;
 
                 case "SubagentStart":
-                    s.SubagentStarted(e.AgentId.Length > 0 ? e.AgentId : "unnamed", now);
+                    s.SubagentStarted(e.AgentId.Length > 0 ? e.AgentId : "unnamed", e.AgentType, now);
                     return null;
 
                 case "SubagentStop":
-                    s.SubagentStopped(e.AgentId.Length > 0 ? e.AgentId : "unnamed");
-                    return null;
+                    // Subagents that finish mid-turn are part of that turn. The last background
+                    // one finishing after the turn ended is the end of everything you started.
+                    if (!s.SubagentStopped(e.AgentId.Length > 0 ? e.AgentId : "unnamed") || s.State == AgentState.Working) return null;
+                    return new ToastRequest
+                    {
+                        SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done, Background = true,
+                        Title = s.Project + " finished",
+                        Detail = "Its background agents are done.",
+                    };
 
                 case "UserPromptSubmit":
                     if (s.State != AgentState.Working) s.WorkingSince = now;
@@ -192,6 +264,9 @@ namespace Aevalsistant
                     return null;
 
                 case "Stop":
+                    // A second Stop with no prompt in between is a turn the agent took on its
+                    // own, usually because a background subagent reported back.
+                    bool onItsOwn = s.NotifiedSincePrompt;
                     s.State = AgentState.Waiting;
                     s.Blocked = false;
                     s.NotifiedSincePrompt = true;
@@ -199,7 +274,7 @@ namespace Aevalsistant
                     s.PendingText = "";
                     return new ToastRequest
                     {
-                        SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done,
+                        SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done, Background = child || onItsOwn,
                         Title = s.Project + (s.Subagents.Count > 0 ? " is waiting" : " finished"),
                         Detail = reply.Length > 0 || s.Agent == "claude" ? Snippet.Clean(reply) : "Ready for your next prompt.",
                         // Only Claude Code's transcript format is known well enough to read the reply from.
@@ -212,7 +287,7 @@ namespace Aevalsistant
                     s.NotifiedSincePrompt = true;
                     return new ToastRequest
                     {
-                        SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.NeedsYou,
+                        SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.NeedsYou, Background = child,
                         Title = s.Project + " stopped early",
                         Detail = "The turn ended on an error. The terminal has the details.",
                     };
@@ -227,7 +302,7 @@ namespace Aevalsistant
                         s.NotifiedSincePrompt = true;
                         return new ToastRequest
                         {
-                            SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done,
+                            SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done, Background = child,
                             Title = s.Project + " is waiting",
                             Detail = e.Message.Length > 0 ? e.Message : "Ready for your next prompt.",
                         };
@@ -238,7 +313,7 @@ namespace Aevalsistant
                         s.Blocked = true;
                         return new ToastRequest
                         {
-                            SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.NeedsYou,
+                            SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.NeedsYou, Background = child,
                             Title = s.Project + " needs you",
                             Detail = e.Message.Length > 0 ? e.Message : "Claude is asking for permission.",
                         };
@@ -272,10 +347,10 @@ namespace Aevalsistant
                 // A subagent counts as alive while its own transcript keeps being written.
                 foreach (var id in s.Subagents.Keys.ToList())
                 {
-                    DateTime seen = s.Subagents[id];
+                    var sub = s.Subagents[id];
                     DateTime? wrote = subagentWrite?.Invoke(s, id);
-                    if (wrote.HasValue && wrote.Value > seen) s.Subagents[id] = seen = wrote.Value;
-                    if (now - seen > StaleWorking) { s.Subagents.Remove(id); changed = true; }
+                    if (wrote.HasValue && wrote.Value > sub.Seen) sub.Seen = wrote.Value;
+                    if (now - sub.Seen > StaleWorking) { s.Subagents.Remove(id); changed = true; }
                 }
                 if (s.State != AgentState.Working) continue;
 
@@ -302,6 +377,15 @@ namespace Aevalsistant
             }
             return changed;
         }
+    }
+
+    // One line of the session list: a session, or one of its subagents (Subagent set).
+    sealed class TreeRow
+    {
+        public Session Session;
+        public string SubagentId;
+        public Subagent Subagent;
+        public int Depth;
     }
 
     sealed class TranscriptProbe
@@ -392,7 +476,7 @@ namespace Aevalsistant
             string t = Fence.Replace(text, " ");
             t = Marks.Replace(t, "");
             t = Space.Replace(t, " ").Trim();
-            return t.Length > 200 ? t.Substring(0, 200) : t;
+            return t.Length > 600 ? t.Substring(0, 600) : t;
         }
     }
 
@@ -415,7 +499,9 @@ namespace Aevalsistant
     sealed class Settings
     {
         public bool Hooks = true;
+        public readonly HashSet<string> AgentsOff = new HashSet<string>();   // agent ids the user turned off one by one
         public bool Startup = true;
+        public bool KeepAwake = true;
         public bool LidAwake;
         public bool DisplayOn;
         public string LidSaved = "";   // "scheme-guid|ac|dc" while our lid override is in effect
@@ -423,6 +509,15 @@ namespace Aevalsistant
         public bool Chats = true;      // watch Claude and ChatGPT desktop chats
         public bool AutoUpdate = true;
         public string LastVersion = "";   // version that last ran, to say "updated to" once
+        public bool NotifyDone = true;
+        public bool NotifyBackgroundDone;
+        public bool NotifyNeedsYou = true;
+        public bool NotifyBackgroundNeedsYou = true;
+        public bool Sound = true;
+        public bool ExpandOnHover = true;
+        public bool AltTab = true;
+        public int CardTime = 1;          // 0 short, 1 normal, 2 long
+        public bool ShowChildren = true;  // list subagents and background sessions under their session
 
         public static Settings Load(string path)
         {
@@ -437,7 +532,9 @@ namespace Aevalsistant
                 switch (k)
                 {
                     case "hooks": s.Hooks = b; break;
+                    case "agentsOff": foreach (var id in v.Split(',')) if (id.Trim().Length > 0) s.AgentsOff.Add(id.Trim()); break;
                     case "startup": s.Startup = b; break;
+                    case "awake": s.KeepAwake = b; break;
                     case "lid": s.LidAwake = b; break;
                     case "display": s.DisplayOn = b; break;
                     case "lidSaved": s.LidSaved = v; break;
@@ -445,6 +542,15 @@ namespace Aevalsistant
                     case "chats": s.Chats = b; break;
                     case "autoUpdate": s.AutoUpdate = b; break;
                     case "lastVersion": s.LastVersion = v; break;
+                    case "notifyDone": s.NotifyDone = b; break;
+                    case "notifyBackgroundDone": s.NotifyBackgroundDone = b; break;
+                    case "notifyNeedsYou": s.NotifyNeedsYou = b; break;
+                    case "notifyBackgroundNeedsYou": s.NotifyBackgroundNeedsYou = b; break;
+                    case "sound": s.Sound = b; break;
+                    case "expand": s.ExpandOnHover = b; break;
+                    case "altTab": s.AltTab = b; break;
+                    case "cardTime": if (int.TryParse(v, out int t) && t >= 0 && t <= 2) s.CardTime = t; break;
+                    case "children": s.ShowChildren = b; break;
                 }
             }
             return s;
@@ -456,9 +562,28 @@ namespace Aevalsistant
             Directory.CreateDirectory(Path.GetDirectoryName(path));
             File.WriteAllText(path, string.Join("\n", new[]
             {
-                "hooks=" + B(Hooks), "startup=" + B(Startup), "lid=" + B(LidAwake), "display=" + B(DisplayOn),
-                "lidSaved=" + LidSaved, "welcomed=" + B(Welcomed), "chats=" + B(Chats), "autoUpdate=" + B(AutoUpdate), "lastVersion=" + LastVersion, "",
+                "hooks=" + B(Hooks), "agentsOff=" + string.Join(",", AgentsOff.OrderBy(x => x)), "startup=" + B(Startup),
+                "awake=" + B(KeepAwake), "lid=" + B(LidAwake), "display=" + B(DisplayOn), "lidSaved=" + LidSaved,
+                "welcomed=" + B(Welcomed), "chats=" + B(Chats), "autoUpdate=" + B(AutoUpdate), "lastVersion=" + LastVersion,
+                "notifyDone=" + B(NotifyDone), "notifyBackgroundDone=" + B(NotifyBackgroundDone),
+                "notifyNeedsYou=" + B(NotifyNeedsYou), "notifyBackgroundNeedsYou=" + B(NotifyBackgroundNeedsYou),
+                "sound=" + B(Sound), "expand=" + B(ExpandOnHover), "altTab=" + B(AltTab),
+                "cardTime=" + CardTime.ToString(CultureInfo.InvariantCulture), "children=" + B(ShowChildren), "",
             }));
+        }
+
+        // Whether a card should show for this request. Background cards also need their
+        // parent setting on, since the menu nests them under it.
+        public bool Wants(ToastRequest r) =>
+            r.Kind == ToastKind.Info
+            || (r.Kind == ToastKind.NeedsYou ? NotifyNeedsYou && (!r.Background || NotifyBackgroundNeedsYou)
+                                             : NotifyDone && (!r.Background || NotifyBackgroundDone));
+
+        // Seconds a card stays up while you are at the keyboard.
+        public double Seconds(ToastKind kind)
+        {
+            double normal = kind == ToastKind.NeedsYou ? 10 : kind == ToastKind.Info ? 5 : 8;
+            return normal * (CardTime == 0 ? 0.6 : CardTime == 2 ? 1.75 : 1);
         }
     }
 
@@ -477,6 +602,9 @@ namespace Aevalsistant
             if (n > 0) return subs + " running";
             return Join("done", Age(now - s.LastEvent), "ago");
         }
+
+        // A subagent's line: "running 4m".
+        public static string Text(Subagent a, DateTime now) => Join("running", Age(now - a.Started));
 
         static string Age(TimeSpan t) =>
             t.TotalMinutes < 1 || t.TotalDays > 7 ? "" : t.TotalHours < 1 ? (int)t.TotalMinutes + "m" : (int)t.TotalHours + "h " + t.Minutes + "m";
