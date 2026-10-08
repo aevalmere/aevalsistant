@@ -8,7 +8,7 @@ using System.Text;
 
 namespace Aevalsistant
 {
-    static class Tests
+    static partial class Tests
     {
         static int failed, passed;
 
@@ -43,6 +43,7 @@ namespace Aevalsistant
                 return r.Downloaded != null ? 0 : 1;
             }
             if (args.Length > 0) Previews(args[0]);
+            if (args.Length > 0) SettingsPreview(args[0]);
             Console.WriteLine($"{passed} passed, {failed} failed");
             return failed == 0 ? 0 : 1;
         }
