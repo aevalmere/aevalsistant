@@ -1,7 +1,8 @@
-# Builds and tests Aevalsistant.exe on Windows for every push and pull request. Pushing a tag
-# such as v1.3.0 also publishes a GitHub release whose only asset is that exe. The tag must match
-# <Version> in Aevalsistant.csproj, and CHANGELOG.md must have a section for it. Installed copies
-# pick the release up on their next update check.
+# Builds and tests Aevalsistant.exe on Windows and Aevalsistant.app on macOS for every push and
+# pull request. Pushing a tag such as v1.3.0 also publishes a GitHub release with both downloads:
+# Aevalsistant.exe and Aevalsistant-mac.zip. The tag must match <Version> in Aevalsistant.csproj,
+# and CHANGELOG.md must have a section for it. Installed copies pick the release up on their next
+# update check.
 name: build
 
 on:
@@ -65,10 +66,41 @@ jobs:
           path: bin/Release/net48/Aevalsistant.exe
           if-no-files-found: error
 
-  # Publishes the exe the build job tested, not a rebuild.
+  mac:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: |
+          echo "::add-matcher::.github/swift-matcher.json"
+          bash mac/build.sh
+
+      - name: Test
+        run: bash mac/test.sh preview-mac
+
+      - name: Run the app
+        run: bash mac/smoke.sh
+
+      - name: Upload card and settings renders
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac-renders
+          path: preview-mac/*.png
+          if-no-files-found: ignore
+
+      - name: Upload app
+        uses: actions/upload-artifact@v7
+        with:
+          name: Aevalsistant-mac
+          path: mac/build/Aevalsistant-mac.zip
+          if-no-files-found: error
+
+  # Publishes the exe and the app the build jobs tested, not rebuilds.
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, mac]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -79,6 +111,10 @@ jobs:
         with:
           name: Aevalsistant-${{ needs.build.outputs.version }}
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: Aevalsistant-mac
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,6 +122,7 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           sha=$(sha256sum Aevalsistant.exe | cut -d' ' -f1)
+          macsha=$(sha256sum Aevalsistant-mac.zip | cut -d' ' -f1)
           awk -v head="## [$VERSION]" '
             index($0, "## [") == 1 { if (on) exit; on = index($0, head) == 1; next }
             on { print }
@@ -94,12 +131,18 @@ jobs:
 
           ### Download
 
-          Download **Aevalsistant.exe** below and run it. It needs Windows 10 or 11 and nothing else.
+          **Windows:** download **Aevalsistant.exe** below and run it. It needs Windows 10 or 11 and
+          nothing else. The exe is not code-signed yet, so Windows may say "Windows protected your
+          PC" the first time. Choose **More info**, then **Run anyway**.
+
+          **Mac:** download **Aevalsistant-mac.zip** below, open it, and open Aevalsistant. It needs
+          macOS 13 or later, on Apple silicon or Intel. The app is not notarized yet, so macOS says it
+          cannot check it the first time: open System Settings, Privacy & Security, and choose
+          **Open Anyway** next to Aevalsistant.
+
           Copies installed from an earlier release update themselves within six hours.
 
-          The exe is not code-signed yet, so Windows may say "Windows protected your PC" the first
-          time. Choose **More info**, then **Run anyway**.
-
-          SHA-256: \`$sha\`
+          - SHA-256 of Aevalsistant.exe: \`$sha\`
+          - SHA-256 of Aevalsistant-mac.zip: \`$macsha\`
           EOF
-          gh release create "$TAG" Aevalsistant.exe --verify-tag --title "Aevalsistant $VERSION" --notes-file notes.md
+          gh release create "$TAG" Aevalsistant.exe Aevalsistant-mac.zip --verify-tag --title "Aevalsistant $VERSION" --notes-file notes.md

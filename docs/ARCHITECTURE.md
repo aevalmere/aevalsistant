@@ -6,8 +6,9 @@ releases of `aevalmere/aevalsistant`.
 
 ## What it is
 
-A Windows tray app for people running several AI agents at once: Claude Code, Codex, Gemini CLI,
-Copilot CLI, Cursor, Windsurf, OpenCode, and the Claude and ChatGPT desktop chats. It does two things:
+A Windows tray app, and a macOS menu bar app (see "The Mac app" below), for people running several
+AI agents at once: Claude Code, Codex, Gemini CLI, Copilot CLI, Cursor, Windsurf, OpenCode, and the
+Claude and ChatGPT desktop chats. It does two things:
 
 1. Keeps the PC awake while any agent is working, so sleep does not cut off a long run.
 2. Drops a notification card from the top center of the screen when an agent finishes or needs
@@ -200,6 +201,76 @@ mono on Linux, with an optional output folder for preview PNGs.
   which sessions are busy until their next prompt. The built-in updater waits for idle instead.
 - A user folder name with a shell character such as `'` or `$`, on a PC with 8.3 names turned off,
   gives a quoted hook path that bash and cmd run but some PowerShell-based hooks may not.
+
+## The Mac app
+
+`mac/` is a separate macOS menu bar app in Swift and AppKit, built to behave like the Windows one.
+It ships as `Aevalsistant-mac.zip` in the same releases, under the same version number, which
+`mac/build.sh` reads from `Aevalsistant.csproj`.
+
+- **Shared logic.** `mac/Sources/Shared/` is a line-for-line port of `Core.cs`, `Agents.cs`, and
+  `Json.cs`: the session state machine, the tree, settings.ini, the hook installers, the payload
+  adapters, and the order-keeping JSON. A change to one side's rules belongs on the other side too;
+  `mac/Tests/CoreTests.swift` carries the same checks as `tests/`. These files use Foundation only,
+  so their tests also run under Swift on Linux.
+- **Settings defaults.** The Mac defaults follow the owner's Windows settings: screen on, lid closed
+  allowed, sound off. The Windows defaults are unchanged.
+- **Hooks.** The same entries, with the command `<app>/Contents/MacOS/Aevalsistant --hook`. A path
+  with a space or a quote is single-quoted for sh, bash, and zsh. Copilot gets a `bash` field
+  instead of `powershell`, Windsurf a plain `command`. An entry written by either app counts as
+  ours, so a home folder synced between a PC and a Mac does not collect two sets.
+- **Hook client.** The `--hook` process walks its parents with `sysctl` and reads each one's short
+  name, executable name, and argv[0]; Claude Code's native build runs from a file named after its
+  version but calls itself `claude`. The nearest ancestor that is a regular app (Terminal, iTerm2,
+  Code, Claude) is the host. It sends the envelope over a Unix socket at
+  `~/Library/Application Support/Aevalsistant/hook.sock` (mode 0600) and exits 0, at once when
+  nothing is listening.
+- **Install.** Opened from anywhere else, the app copies itself into `/Applications` (or
+  `~/Applications` without write access there), strips the download quarantine from the copy, asks a
+  running copy to quit, and opens the installed one. macOS keeps a running app's open files, so the
+  bundle is replaced in place.
+- **Card.** `Toast.swift` draws the same layout as `ToastArt` with AppKit text into a bitmap at the
+  screen's scale, in a borderless non-activating panel on every Space, under the menu bar of the
+  screen with the pointer. The frame timer moves a layer and changes the window's alpha, so the
+  drop redraws nothing. `sharingType = .none` keeps it out of captures up to macOS 14.
+- **Option-Tab.** A Carbon hot key, registered only while a card with a target is up. It needs no
+  permission. Alt+Tab's Mac counterpart, Command-Tab, belongs to the system switcher.
+- **Focus.** `NSRunningApplication.activate`, then Launch Services if macOS 14's activation rules
+  refused it. With Accessibility access, the window whose title has the project name is raised
+  first.
+- **Keep-awake.** `PreventUserIdleSystemSleep` and, with the screen option,
+  `PreventUserIdleDisplaySleep` power assertions. Assertions do not cover the lid, so the lid option
+  installs `/etc/sudoers.d/aevalsistant` once, through an administrator prompt, after `visudo -c`
+  checks it. It allows only `pmset -a disablesleep 0` and `1`. Sleep is turned off while agents work,
+  back on after, and on the next start after a crash; if the user had turned it off themselves, the
+  app leaves it alone. A Mac whose lid is still shut a minute after the agents finish is put to
+  sleep with `pmset sleepnow`.
+- **Chats.** `Chats.swift` watches app switches through `NSWorkspace` and walks the Claude or
+  ChatGPT app's accessibility tree for the Stop button, after setting `AXManualAccessibility` so the
+  Electron app builds one. It needs Accessibility access and starts by itself once that is granted.
+  `ChatTracker` is shared and keyed by pid.
+- **Updates.** The same GitHub check, for `Aevalsistant-mac.zip`. The zip must match its digest, the
+  unpacked bundle must have this app's bundle id and the release's version, and `codesign --verify`
+  must pass. Then it is opened and the install hand-off replaces the installed copy.
+- **Status.** `Aevalsistant --status` prints the running app's sessions, keep-awake state, card, and
+  agent connections as JSON. `mac/smoke.sh` uses it to drive the built app in CI.
+- **Not verified yet on real Macs:** the lid rule on a MacBook (CI runners have no lid), focusing
+  windows in each host app, chat watching against the real Claude and ChatGPT apps, and Gatekeeper's
+  first-run prompt for the downloaded zip.
+
+| File | Contents |
+|---|---|
+| `mac/Sources/Shared/` | `Core.swift`, `Agents.swift`, `Json.swift`: the ported platform-free logic, plus release-asset parsing |
+| `mac/Sources/App/AppController.swift` | Menu bar item and menu, socket messages, cards queue, sweep, keep-awake and lid wiring, Settings contents, hooks file I/O, uninstall |
+| `mac/Sources/App/Launcher.swift` | Install into Applications, hand-off, single instance |
+| `mac/Sources/App/HookClient.swift`, `Ipc.swift` | `--hook` mode and the Unix socket on both ends |
+| `mac/Sources/App/Processes.swift` | Process tree walk, host app labels, liveness, focus |
+| `mac/Sources/App/Toast.swift` | Card renderer, panel, animation, hover, Option-Tab hot key |
+| `mac/Sources/App/SettingsWindow.swift` | The Settings window and its drawn rows |
+| `mac/Sources/App/Power.swift` | Power assertions, lid rule and `pmset`, chimes |
+| `mac/Sources/App/Chats.swift`, `Updater.swift`, `Theme.swift` | Chat watcher, updater, palette and menu bar glyph |
+| `mac/Tests/` | The shared checks, plus card, Settings, and glyph checks and renders |
+| `mac/build.sh`, `test.sh`, `smoke.sh` | Build the universal app and zip, run the checks, run the app against a scratch home |
 
 ## Next steps
 

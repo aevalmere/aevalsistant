@@ -7,3 +7,5 @@ preview/
 *.user
 *.aevalsistant.bak
 .claude/
+mac/build/
+preview-mac/

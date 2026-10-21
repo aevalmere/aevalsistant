@@ -5,6 +5,17 @@ Each release's section here becomes its notes on the
 [semantic versioning](https://semver.org): the patch number for fixes, the minor number for new
 features, the major number for changes that need you to do something.
 
+## [Unreleased]
+
+### New
+
+- A Mac version: a menu bar app for macOS 13 or later, on Apple silicon and Intel, downloaded as
+  Aevalsistant-mac.zip from the same releases. It connects the same agents, keeps the Mac awake
+  while they work, drops the same card when one finishes or needs you, and updates itself.
+- On the Mac, Option-Tab jumps to the agent while a card is up, and "Keep working with the lid
+  closed" asks for your password once so it can turn sleep off while agents work.
+- The Mac app starts with the screen kept on, the lid option on, and the sound off.
+
 ## [1.4.0] - 2026-10-08
 
 ### New
