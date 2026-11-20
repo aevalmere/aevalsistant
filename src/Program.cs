@@ -16,6 +16,7 @@ namespace Aevalsistant
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Aevalsistant");
         public static readonly string InstalledExe = Path.Combine(Home, "Aevalsistant.exe");
         public static readonly string SettingsPath = Path.Combine(Home, "settings.ini");
+        public static readonly string TimePath = Path.Combine(Home, "time.ini");
         public static readonly string PipeName = "aevalsistant." + Environment.UserName.ToLowerInvariant();
         public const string MutexName = @"Local\Aevalsistant.Instance";
 

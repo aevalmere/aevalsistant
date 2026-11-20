@@ -12,6 +12,7 @@ enum AppPaths {
 
     static let home = userHome + "/Library/Application Support/Aevalsistant"
     static let settings = home + "/settings.ini"
+    static let time = home + "/time.ini"
 
     // Unix socket paths are limited to 104 bytes; a very long home folder falls back to /tmp,
     // where the socket is still only reachable by this user.

@@ -162,6 +162,34 @@ final class SettingsWindow: NSWindow, NSWindowDelegate {
         relayout()
     }
 
+    // A toggle placed right after another toggle's row instead of at the end of the page, so a
+    // list that grows while the window is open (the watched apps) keeps its button below it.
+    // With no anchor it goes at the end, like addToggle.
+    @discardableResult
+    func insertToggle(afterRowOf anchor: Toggle?, _ label: String, _ note: String?, _ on: Bool, under parent: Toggle?, _ changed: @escaping (Bool) -> Void) -> Toggle {
+        let row = ToggleRow(label, note ?? "", on, changed)
+        row.win = self
+        row.under = parent
+        row.depth = parent.map { $0.row.depth + 1 } ?? 0
+        var at = items.count
+        if let a = anchor, let i = items.firstIndex(where: { $0 === a.row }) { at = i + 1 }
+        row.first = at == 0
+        items.insert(row, at: at)
+        page.addSubview(row)
+        row.open.set(0, animate: false)   // opens with the usual slide
+        showHide()
+        return row.setting
+    }
+
+    // Takes a toggle's row off the page; the rows under it close up.
+    func remove(_ t: Toggle) {
+        guard let i = items.firstIndex(where: { $0 === t.row }) else { return }
+        items.remove(at: i)
+        t.row.removeFromSuperview()
+        if let head = items.first { head.first = true }
+        relayout()
+    }
+
     private func add(_ row: Row, under parent: Toggle?) {
         row.win = self
         row.under = parent

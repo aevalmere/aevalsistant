@@ -62,12 +62,27 @@ enum AppTests {
                                 "Your Mac won't sleep until the last agent stops. The screen can still turn off on its usual timer.", true) { _ in awakeCalls += 1 }
         let screen = w.addToggle("Keep the screen on too", nil, true, under: awake) { _ in }
         let lid = w.addToggle("Keep working with the lid closed", "Asks for your password once. When the agents finish with the lid shut, the Mac goes to sleep.", true, under: awake) { _ in }
+        let watch = w.addToggle("Also while these apps are open", "Counts as an agent working: the Mac stays awake and the screen and lid settings apply.", true, under: awake) { _ in }
+        let blender = w.addToggle("Blender", "Open 1h 2m", true, under: watch) { _ in }
+        w.addButton("Add an app…", under: watch) {}
+        let beforeInsert = w.pageHeight
+        let obs = w.insertToggle(afterRowOf: blender, "OBS Studio", "Not open", false, under: watch) { _ in }
+        check(obs.shown && w.pageHeight > beforeInsert, "settings: an inserted toggle is shown and grows the page")
+        let krita = w.insertToggle(afterRowOf: obs, "Krita", "Not open", true, under: watch) { _ in }
+        let withKrita = w.pageHeight
+        w.remove(krita)
+        check(w.pageHeight < withKrita, "settings: a removed toggle leaves the page")
 
         w.section("Notifications")
+        w.addChoice("Notify me", ["Always", "When needed", "Never"], 0) { _ in }
         let finish = w.addToggle("Show a card when an agent finishes", nil, true) { _ in }
         w.addToggle("Also when background agents finish", "Subagents, and agents that another agent started.", false, under: finish) { _ in }
+        w.addChoice("Only after turns longer than", ["Any", "1 min", "5 min", "15 min"], 1, under: finish) { _ in }
         let needs = w.addToggle("Show a card when an agent needs you", nil, true) { _ in }
         w.addToggle("Also when a background agent needs you", nil, true, under: needs) { _ in }
+        let remind = w.addToggle("Remind me while an agent still needs you", nil, true, under: needs) { _ in }
+        w.addChoice("Remind every", ["2 min", "5 min", "10 min"], 1, under: remind) { _ in }
+        w.addToggle("Only when I'm not looking at the agent", "No card when the agent's app is already in front.", false) { _ in }
         let sound = w.addToggle("Play a sound", "A soft chime with each card. Quiet while an app is full screen.", false) { _ in }
         w.addButton("Finished", under: sound) {}
         w.addToggle("Expand the card on hover to show the whole message", nil, true) { _ in }
@@ -84,6 +99,10 @@ enum AppTests {
         let chats = w.addToggle("Watch Claude and ChatGPT desktop chats", "Notices a reply finishing while you are in another app.", true) { _ in }
         w.addNote("Needs Accessibility access: allow Aevalsistant in System Settings, Privacy & Security, Accessibility.", under: chats)
         w.addButton("Open Accessibility settings", under: chats) {}
+
+        w.section("Time")
+        w.addNote("Today: Claude Code 2h 5m, Blender 1h 2m, Codex 12m\nAll time: Claude Code 41h 3m, Blender 18h 40m, Codex 3h 2m")
+        w.addButton("Reset times") {}
 
         w.section("General")
         w.addToggle("Open at login", nil, true) { _ in }

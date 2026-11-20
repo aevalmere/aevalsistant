@@ -157,19 +157,38 @@ namespace Aevalsistant
             Reflow();
         }
 
-        void Add(Item item, Toggle parent)
+        // A toggle placed right after another row instead of at the end, for lists that grow
+        // while the window is open.
+        public Toggle InsertToggle(Toggle after, string label, string note, bool on, Action<bool> changed, Toggle parent)
+        {
+            var row = new ToggleRow(this, label, note, on, changed);
+            int at = after == null ? items.Count : items.IndexOf(after.Row) + 1;
+            Add(row, parent, at <= 0 ? items.Count : at);
+            return row.Setting;
+        }
+
+        // Closes the row and leaves it out of the page from then on.
+        public void Remove(Toggle t)
+        {
+            if (t == null) return;
+            t.Row.Removed = true;
+            ShowHide();
+        }
+
+        void Add(Item item, Toggle parent, int at = -1)
         {
             item.Under = parent;
             item.Depth = parent == null ? 0 : parent.Row.Depth + 1;
-            item.TabIndex = items.Count;
-            items.Add(item);
+            if (at < 0 || at > items.Count) at = items.Count;
+            items.Insert(at, item);
+            for (int i = 0; i < items.Count; i++) items[i].TabIndex = i;
             page.Controls.Add(item);
             ShowHide();
         }
 
         internal bool IsFirst(Item item) => items.Count > 0 && items[0] == item;
 
-        static bool InView(Item it) => it.Wanted && (it.Under == null || (it.Under.On && InView(it.Under.Row)));
+        static bool InView(Item it) => !it.Removed && it.Wanted && (it.Under == null || (it.Under.On && InView(it.Under.Row)));
 
         // Called whenever a toggle flips or a note empties or fills: rows whose chain of parent
         // toggles changed open or close, and the page reflows around them.
@@ -692,6 +711,7 @@ namespace Aevalsistant
             internal int Depth;
             internal readonly Glide Open = new Glide(180, 1, Ease.Exit);
             internal bool Placed = true;
+            internal bool Removed;
             internal double LastOpen = 1;
             int measuredFor = -1, measured;
 

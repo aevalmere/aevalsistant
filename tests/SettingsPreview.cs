@@ -19,12 +19,24 @@ namespace Aevalsistant
                     "Windows won't sleep until the last agent stops. The screen can still turn off on its usual timer.", true, v => awakeCalls++);
                 var screen = w.AddToggle("Keep the screen on too", null, false, v => { }, awake);
                 var lid = w.AddToggle("Keep working with the lid closed", "When the agents finish with the lid shut, the laptop goes to sleep.", false, v => { }, awake);
+                var watch = w.AddToggle("Also while these apps are open", "Counts as an agent working: the PC stays awake, and the screen and lid settings apply.", true, v => { }, awake);
+                var blender = w.AddToggle("Blender", "Open 1h 12m", true, v => { }, watch);
+                w.AddButton("Add an app…", () => { }, watch);
+                var obs = w.InsertToggle(blender, "OBS Studio", "Not open", true, v => { }, watch);
+                var gone = w.InsertToggle(obs, "Removed app", "Not open", true, v => { }, watch);
+                w.Remove(gone);
+                Check(obs.Shown && !gone.Shown, "settings: app rows can be added and removed while the window is open");
 
                 w.Section("Notifications");
+                w.AddChoice("Notify me", new[] { "Always", "When needed", "Never" }, 0, i => { });
                 var finish = w.AddToggle("Show a card when an agent finishes", null, true, v => { });
                 w.AddToggle("Also when background agents finish", null, false, v => { }, finish);
+                w.AddChoice("Only after turns longer than", new[] { "Any", "1 min", "5 min", "15 min" }, 1, i => { }, finish);
                 var needs = w.AddToggle("Show a card when an agent needs you", null, true, v => { });
                 w.AddToggle("Also when a background agent needs you", null, true, v => { }, needs);
+                var remind = w.AddToggle("Remind me while an agent still needs you", null, true, v => { }, needs);
+                w.AddChoice("Remind every", new[] { "2 min", "5 min", "10 min" }, 1, i => { }, remind);
+                w.AddToggle("Only when I'm not looking at the agent", "No card when the agent's window is already in front.", false, v => { });
                 var sound = w.AddToggle("Play a sound", null, true, v => { });
                 w.AddButton("Play", () => { }, sound);
                 w.AddToggle("Expand the card on hover to show the whole message", null, true, v => { });
@@ -39,6 +51,10 @@ namespace Aevalsistant
                 var cursor = w.AddToggle("Cursor", "Not connected", false, v => { }, agents);
                 w.AddToggle("List subagents under their session", null, true, v => { });
                 w.AddToggle("Watch Claude and ChatGPT desktop chats", null, true, v => { });
+
+                w.Section("Time");
+                w.AddNote("Today: Blender 3h 10m, Claude Code 2h 5m\nAll time: Claude Code 41h 2m, Blender 12h 40m");
+                w.AddButton("Reset times", () => { });
 
                 w.Section("General");
                 w.AddToggle("Start with Windows", null, true, v => { });

@@ -40,6 +40,10 @@ sleep off and on (`pmset disablesleep`) and nothing else. Cancel, and the settin
 
 - A Windows power request keeps the PC from sleeping until the last agent stops, then lets go.
   Optionally it keeps the screen on too, or keeps a laptop working with the lid closed.
+- Apps you pick keep the computer awake too while they are open, the same way a working agent does.
+  Blender is on the list from the start; **Add an app** in Settings searches the apps running now.
+- It keeps time: how long each session has worked, and today's and all-time totals for each agent
+  and each watched app, in the menu and in Settings.
 - The card's top row is the session that just changed. Under it is every other session with its
   state: needs you, done 3m ago, working 12m. Subagents, and sessions that another agent started,
   are listed under the session they belong to.
@@ -49,6 +53,9 @@ sleep off and on (`pmset disablesleep`) and nothing else. Cancel, and the settin
   is showing jumps to the top one.
 - Background work stays quiet: a subagent or a session started by another agent finishing does not
   pop a card, unless you turn that on. Anything that needs you still does.
+- You choose when cards show: always, only when an agent needs you, or never; only after turns
+  longer than a minute or more; only when you are not already looking at that agent's window; and
+  a reminder every few minutes while an agent is still waiting on you.
 - An optional soft chime, one for "finished" and one for "needs you", that stays quiet during
   presentations and full-screen games.
 - The card never takes keyboard focus, is hidden from screenshots and screen sharing, and only
@@ -106,11 +113,17 @@ only appear while it is on. The Mac app starts with keep-awake fully on and the 
 | Keep the PC (Mac) awake while agents work | On | On | Stops the computer from sleeping until the last agent stops. The screen can still turn off |
 | &nbsp;&nbsp;Keep the screen on too | Off | On | Also stops the display from turning off |
 | &nbsp;&nbsp;Keep working with the lid closed | Off | On | Laptops only. Lets the laptop keep working with the lid shut while agents work, puts things back after, and sleeps a minute after the agents finish if the lid is still shut. Windows sets the lid action to "Do nothing"; the Mac turns sleep off with `pmset` and asks for your password once |
+| &nbsp;&nbsp;Also while these apps are open | On | On | An open app on the list counts as an agent working, so the screen and lid options above apply to it too. Each app has its own switch and shows how long it has been open. Any part of an app counts: `blender` also matches `blender-launcher` |
+| &nbsp;&nbsp;&nbsp;&nbsp;Add an app | | | Opens a search over the apps running now. Click one to add it, click it again to take it off. Typing also finds background processes |
 | **Notifications** | | | |
+| Notify me | Always | Always | Always, When needed (only when an agent needs you), or Never. Sets the two switches below |
 | Show a card when an agent finishes | On | On | |
 | &nbsp;&nbsp;Also when background agents finish | Off | Off | Subagents, sessions another agent started, and turns an agent takes on its own |
+| &nbsp;&nbsp;Only after turns longer than | Any | Any | Any, 1, 5, or 15 minutes. Quicker turns finish without a card |
 | Show a card when an agent needs you | On | On | Permission prompts and questions |
 | &nbsp;&nbsp;Also when a background agent needs you | On | On | |
+| &nbsp;&nbsp;Remind me while an agent still needs you | Off | Off | Shows the card again every 2, 5, or 10 minutes until you answer |
+| Only when I'm not looking at the agent | Off | Off | No card when the agent's window (on a Mac, its app) is already in front |
 | Play a sound | On | Off | A soft chime with each card; buttons under it play each one |
 | Expand the card on hover | On | On | Shows the whole message |
 | Alt+Tab (Option-Tab) jumps to the agent while the card is up | On | On | |
@@ -119,6 +132,7 @@ only appear while it is on. The Mac app starts with keep-awake fully on and the 
 | Connect coding agents | On | On | Adds or removes the hooks in the table above, with a switch for each agent found on this computer |
 | List subagents under their session | On | On | In the card and the menu |
 | Watch Claude and ChatGPT desktop chats | On | On | Notices replies finishing in the desktop chat apps. On a Mac this needs Accessibility access, which Settings has a button for |
+| **Time** | | | Today's and all-time totals for each agent and each watched app, with **Reset times** |
 | **General** | | | |
 | Start with Windows (Open at login) | On | On | Starts the app when you sign in |
 | Update automatically | On | On | Checks for a new release two minutes after start and every six hours |
@@ -128,7 +142,8 @@ and the issue tracker, and **Remove from this PC** (**Remove from this Mac**).
 
 ## What it changes on your PC
 
-- Copies itself to `%LOCALAPPDATA%\Aevalsistant\`, and keeps its settings there in `settings.ini`.
+- Copies itself to `%LOCALAPPDATA%\Aevalsistant\`, and keeps its settings there in `settings.ini`
+  and its time totals in `time.ini`.
 - Adds hook entries to the files in the table above, for agents that are installed.
 - Adds a `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry when "Start with Windows" is on.
 - While agents work: a power request named "Aevalsistant: AI agents are running" (check with
@@ -141,7 +156,8 @@ and the issue tracker, and **Remove from this PC** (**Remove from this Mac**).
 On a Mac:
 
 - Lives in `/Applications/Aevalsistant.app` (or `~/Applications`), and keeps its settings in
-  `~/Library/Application Support/Aevalsistant/settings.ini`, next to the socket agents report to.
+  `~/Library/Application Support/Aevalsistant/settings.ini` (time totals in `time.ini`), next to the
+  socket agents report to.
 - Adds the same hook entries, with the app's path inside the bundle as the command.
 - Adds itself to Login Items when "Open at login" is on.
 - While agents work: a power assertion named "Aevalsistant: AI agents are running" (check with

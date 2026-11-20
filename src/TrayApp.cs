@@ -48,6 +48,14 @@ namespace Aevalsistant
         SettingsWindow settingsWindow;
         Note updateNote, lidNote, chatNote;
         readonly Dictionary<string, Toggle> agentToggles = new Dictionary<string, Toggle>();
+        readonly TimeLog timeLog = TimeLog.Load(App.TimePath);
+        // Watched apps open right now, by name, with when each was first seen open.
+        readonly Dictionary<string, DateTime> appsOpen = new Dictionary<string, DateTime>();
+        readonly Dictionary<string, Toggle> appToggles = new Dictionary<string, Toggle>();
+        Toggle watchToggle, doneToggle, asksToggle;
+        Choice notifyChoice;
+        Note timeNote;
+        AppPicker picker;
 
         public TrayApp()
         {
@@ -72,6 +80,7 @@ namespace Aevalsistant
 
             if (settings.Hooks) SyncAgents(true);
             if (settings.Chats) StartChats();
+            ScanApps();
             SetStartup(settings.Startup);
 
             menu.Renderer = new PaperMenuRenderer();
@@ -190,6 +199,15 @@ namespace Aevalsistant
             return fg == IntPtr.Zero || Native.GetAncestor(fg, Native.GA_ROOT) != new IntPtr(h);
         }
 
+        // The agent's own window is the one in front, so you are already looking at it.
+        bool InFront(ToastRequest req)
+        {
+            long h = book.Get(req.SessionId)?.Hwnd ?? req.Hwnd;
+            if (h == 0) return false;
+            IntPtr fg = Native.GetForegroundWindow();
+            return fg != IntPtr.Zero && Native.GetAncestor(fg, Native.GA_ROOT) == new IntPtr(h);
+        }
+
         void FocusTarget(string sessionId, long hwnd)
         {
             long h = book.Get(sessionId)?.Hwnd ?? hwnd;
@@ -200,7 +218,7 @@ namespace Aevalsistant
 
         void Enqueue(ToastRequest req)
         {
-            if (!settings.Wants(req))
+            if (!settings.Wants(req) || (settings.NotifyAway && req.Kind != ToastKind.Info && InFront(req)))
             {
                 // No card for this, but the list under a card already showing stays current.
                 if (toast.Showing) ShowTop(false);
@@ -329,6 +347,16 @@ namespace Aevalsistant
                     catch (IOException) { return null; }
                     catch (UnauthorizedAccessException) { return null; }
                 });
+            bool appsChanged = ScanApps();
+            var now = DateTime.UtcNow;
+            var active = book.All.Where(x => x.Busy).Select(x => TimeKeys.Agent(x.Agent)).Concat(appsOpen.Keys.Select(TimeKeys.App)).ToList();
+            book.Credit(timeLog.Tick(now, TimeLog.DayString(DateTime.Now), active));
+            if (sweeps % 12 == 0) SaveTime();
+            if (settings.Remind)
+                foreach (var r in book.Reminders(now, TimeSpan.FromMinutes(Settings.RemindMinutes[settings.RemindAfter]))) Enqueue(r);
+            if (appsChanged) RefreshState();
+            RefreshSettingsNotes();
+
             int before = pending.Count;
             pending.RemoveAll(p => p.SessionId != null && book.Get(p.SessionId) == null);
             if (pending.Count != before) { if (pending.Count == 0) toast.Hide(); else if (toast.Showing) ShowTop(); }
@@ -355,6 +383,105 @@ namespace Aevalsistant
             chats = null;
             foreach (var s in book.All.Where(x => x.Agent == "chat").ToList())
                 Ingest(new HookEvent { Name = "SessionEnd", SessionId = s.Id });
+        }
+
+        // ---- watched apps -----------------------------------------------------------------
+
+        // Which watched apps are open. True when that changed.
+        bool ScanApps()
+        {
+            var names = settings.WatchAppsOn && settings.WatchApps.Any(a => a.On) ? RunningApp.Names() : new HashSet<string>();
+            var open = settings.WatchAppsOn
+                ? settings.WatchApps.Where(a => a.On && names.Any(n => WatchMatch.Matches(a.Name, n))).Select(a => a.Name).ToList()
+                : new List<string>();
+            bool changed = open.Count != appsOpen.Count || open.Any(n => !appsOpen.ContainsKey(n));
+            foreach (var gone in appsOpen.Keys.Where(k => !open.Contains(k)).ToList()) appsOpen.Remove(gone);
+            foreach (var n in open) if (!appsOpen.ContainsKey(n)) appsOpen[n] = DateTime.UtcNow;
+            return changed;
+        }
+
+        string AppLabel(string name) => settings.WatchApps.FirstOrDefault(a => a.Name == name)?.Label ?? name;
+
+        // "2 agents working, Blender open"
+        string AwakeReason(int working)
+        {
+            var parts = new List<string>();
+            if (working > 0) parts.Add(Plural.Agents(working) + " working");
+            if (appsOpen.Count > 0) parts.Add(string.Join(" and ", appsOpen.Keys.Select(AppLabel)) + " open");
+            return string.Join(", ", parts);
+        }
+
+        string AppNote(WatchedApp a)
+        {
+            if (!appsOpen.TryGetValue(a.Name, out var since)) return a.On ? "Not open" : "Off";
+            double secs = (DateTime.UtcNow - since).TotalSeconds;
+            return secs < 60 ? "Open" : "Open " + Status.Duration(secs);
+        }
+
+        void OpenPicker()
+        {
+            if (picker != null && !picker.IsDisposed) { picker.Activate(); return; }
+            picker = new AppPicker(name => settings.WatchApps.Any(a => a.Name == name && a.On), AddApp, RemoveApp);
+            picker.FormClosed += (s, e) => picker = null;
+            picker.Show();
+        }
+
+        void AddApp(RunningApp r)
+        {
+            var known = settings.WatchApps.FirstOrDefault(a => a.Name == r.Name);
+            if (known != null)
+            {
+                known.On = true;
+                if (appToggles.TryGetValue(known.Name, out var t)) t.On = true;
+            }
+            else
+            {
+                var app = new WatchedApp { Name = r.Name, Label = r.Label, On = true };
+                var lastApp = settings.WatchApps.LastOrDefault(a => appToggles.ContainsKey(a.Name));
+                settings.WatchApps.Add(app);
+                if (settingsWindow != null && watchToggle != null)
+                {
+                    var after = lastApp != null ? appToggles[lastApp.Name] : watchToggle;
+                    appToggles[app.Name] = settingsWindow.InsertToggle(after, app.Label, AppNote(app), true, v => SetAppOn(app, v), watchToggle);
+                }
+            }
+            AppsChanged();
+        }
+
+        void RemoveApp(string name)
+        {
+            settings.WatchApps.RemoveAll(a => a.Name == name);
+            if (appToggles.TryGetValue(name, out var t)) { settingsWindow?.Remove(t); appToggles.Remove(name); }
+            AppsChanged();
+        }
+
+        void SetAppOn(WatchedApp app, bool on)
+        {
+            app.On = on;
+            AppsChanged();
+        }
+
+        void AppsChanged()
+        {
+            Save();
+            ScanApps();
+            RefreshState();
+            RefreshSettingsNotes();
+        }
+
+        void SaveTime()
+        {
+            try { timeLog.Save(App.TimePath); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        string TimeLabel(string key) => TimeKeys.Label(key, settings.WatchApps);
+
+        string TimeText()
+        {
+            string today = TimeLog.Summary(timeLog.Today, TimeLabel), total = TimeLog.Summary(timeLog.Total, TimeLabel);
+            return "Today: " + (today.Length > 0 ? today : "nothing yet") + "\nAll time: " + (total.Length > 0 ? total : "nothing yet");
         }
 
         // ---- updates ----------------------------------------------------------------------
@@ -401,7 +528,7 @@ namespace Aevalsistant
             busyWindows = new HashSet<long>(book.All.Where(x => x.Busy && x.Agent != "chat" && x.Hwnd != 0).Select(x => x.Hwnd));
             TryApplyUpdate();
             int working = book.BusyCount;
-            bool on = working > 0;
+            bool on = working > 0 || appsOpen.Count > 0;
             bool keep = on && settings.KeepAwake;
             awake.Set(keep, keep && settings.DisplayOn);
 
@@ -442,8 +569,8 @@ namespace Aevalsistant
                 tray.Icon = trayIcon;
                 if (old != null) { Native.DestroyIcon(old.Handle); old.Dispose(); }
             }
-            string tip = keep ? "Aevalsistant: keeping awake, " + Plural.Agents(working) + " working"
-                : on ? "Aevalsistant: " + Plural.Agents(working) + " working, sleep allowed"
+            string tip = keep ? "Aevalsistant: keeping awake, " + AwakeReason(working)
+                : on ? "Aevalsistant: " + AwakeReason(working) + ", sleep allowed"
                 : "Aevalsistant: idle, sleep allowed";
             tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
         }
@@ -455,7 +582,7 @@ namespace Aevalsistant
             lidSleep.Stop();
             uint? action = lidActionDue;
             lidActionDue = null;
-            if (action == null || book.BusyCount > 0 || lid?.Closed != true) return;
+            if (action == null || book.BusyCount > 0 || appsOpen.Count > 0 || lid?.Closed != true) return;
             Battery.Suspend(hibernate: action == 2);
         }
 
@@ -478,9 +605,10 @@ namespace Aevalsistant
 
             int working = book.BusyCount;
             menu.Items.Add(Label("Aevalsistant " + Updater.Current.ToString(3), "header", bold: true));
-            menu.Items.Add(Label(working == 0 ? "Idle. Sleep is allowed."
-                : settings.KeepAwake ? "Keeping awake: " + Plural.Agents(working) + " working"
-                : Plural.Agents(working) + " working. Sleep is allowed.", "status"));
+            bool busy = working > 0 || appsOpen.Count > 0;
+            menu.Items.Add(Label(!busy ? "Idle. Sleep is allowed."
+                : settings.KeepAwake ? "Keeping awake: " + AwakeReason(working)
+                : AwakeReason(working) + ". Sleep is allowed.", "status"));
             menu.Items.Add(new ToolStripSeparator());
 
             // Every session, with what it started indented under it.
@@ -493,9 +621,10 @@ namespace Aevalsistant
                 var row = RowFor(r, now);
                 Color color = row.State == RowState.NeedsYou ? Theme.Blush : row.State == RowState.Working ? Theme.Slate : Theme.SlateSoft;
                 string text = row.Host.Length > 0 ? row.Name + "  \u00B7  " + row.Host : row.Name;
+                string worked = r.Subagent == null ? Status.Worked(r.Session) : "";
                 var item = new ToolStripMenuItem(r.Depth > 0 ? "\u2003\u2003" + text : text)
                 {
-                    ShortcutKeyDisplayString = row.Status,
+                    ShortcutKeyDisplayString = worked.Length > 0 ? row.Status + "  \u00B7  " + worked : row.Status,
                     Image = Theme.Dot(r.Depth > 0 ? (int)Math.Round(dot * 0.8) : dot, color, row.State == RowState.Working),
                     Enabled = CanFocus(row.SessionId, row.Hwnd),
                     ToolTipText = r.Subagent == null && r.Session.Cwd.Length > 0 ? r.Session.Cwd : row.Name,
@@ -506,6 +635,16 @@ namespace Aevalsistant
                 menu.Items.Add(item);
             }
             if (tree.Count > MaxItems) menu.Items.Add(Label((tree.Count - MaxItems) + " more", "status"));
+            foreach (var kv in appsOpen.OrderBy(kv => kv.Value))
+            {
+                double secs = (now - kv.Value).TotalSeconds;
+                var item = Label(AppLabel(kv.Key) + "  \u00B7  open", "app");
+                item.ShortcutKeyDisplayString = secs < 60 ? "just opened" : Status.Duration(secs);
+                item.Image = Theme.Dot(dot, Theme.Slate, true);
+                menu.Items.Add(item);
+            }
+            string todaySummary = TimeLog.Summary(timeLog.Today, TimeLabel);
+            if (todaySummary.Length > 0) menu.Items.Add(Label("Today: " + todaySummary, "status"));
             menu.Items.Add(new ToolStripSeparator());
 
             // Things that need doing stay visible here; everything else lives in Settings.
@@ -576,14 +715,47 @@ namespace Aevalsistant
                     settings.LidAwake, v => { settings.LidAwake = v; lidProblem = null; Save(); RefreshState(); RefreshSettingsNotes(); }, keep);
                 lidNote = w.AddNote(lidProblem ?? "", lidToggle);
             }
+            watchToggle = w.AddToggle("Also while these apps are open",
+                "Counts as an agent working: the PC stays awake, and the screen and lid settings apply.",
+                settings.WatchAppsOn, v => { settings.WatchAppsOn = v; AppsChanged(); }, keep);
+            appToggles.Clear();
+            foreach (var app in settings.WatchApps.ToList())
+            {
+                var a = app;
+                appToggles[a.Name] = w.AddToggle(a.Label, AppNote(a), a.On, v => SetAppOn(a, v), watchToggle);
+            }
+            w.AddButton("Add an app\u2026", OpenPicker, watchToggle);
 
             w.Section("Notifications");
-            var done = w.AddToggle("Show a card when an agent finishes", null, settings.NotifyDone, v => { settings.NotifyDone = v; Save(); });
+            notifyChoice = w.AddChoice("Notify me", new[] { "Always", "When needed", "Never" }, settings.NotifyMode, i =>
+            {
+                settings.NotifyMode = i;
+                Save();
+                if (doneToggle != null) doneToggle.On = settings.NotifyDone;
+                if (asksToggle != null) asksToggle.On = settings.NotifyNeedsYou;
+            });
+            var done = doneToggle = w.AddToggle("Show a card when an agent finishes", null, settings.NotifyDone, v =>
+            {
+                settings.NotifyDone = v;
+                Save();
+                if (notifyChoice != null) notifyChoice.Selected = settings.NotifyMode;
+            });
             w.AddToggle("Also when background agents finish", "Subagents, and agents that another agent started.",
                 settings.NotifyBackgroundDone, v => { settings.NotifyBackgroundDone = v; Save(); }, done);
-            var asks = w.AddToggle("Show a card when an agent needs you", null, settings.NotifyNeedsYou, v => { settings.NotifyNeedsYou = v; Save(); });
+            w.AddChoice("Only after turns longer than", new[] { "Any", "1 min", "5 min", "15 min" }, settings.MinTurn,
+                i => { settings.MinTurn = i; Save(); }, done);
+            var asks = asksToggle = w.AddToggle("Show a card when an agent needs you", null, settings.NotifyNeedsYou, v =>
+            {
+                settings.NotifyNeedsYou = v;
+                Save();
+                if (notifyChoice != null) notifyChoice.Selected = settings.NotifyMode;
+            });
             w.AddToggle("Also when a background agent needs you", null,
                 settings.NotifyBackgroundNeedsYou, v => { settings.NotifyBackgroundNeedsYou = v; Save(); }, asks);
+            var remind = w.AddToggle("Remind me while an agent still needs you", null, settings.Remind, v => { settings.Remind = v; Save(); }, asks);
+            w.AddChoice("Remind every", new[] { "2 min", "5 min", "10 min" }, settings.RemindAfter, i => { settings.RemindAfter = i; Save(); }, remind);
+            w.AddToggle("Only when I'm not looking at the agent", "No card when the agent's window is already in front.",
+                settings.NotifyAway, v => { settings.NotifyAway = v; Save(); });
             var sound = w.AddToggle("Play a sound", "A soft chime with each card. Quiet during presentations and full-screen games.",
                 settings.Sound, v => { settings.Sound = v; Save(); });
             w.AddButton("Finished", () => Sound.Play(ToastKind.Done), sound);
@@ -625,6 +797,10 @@ namespace Aevalsistant
             });
             chatNote = w.AddNote(chatProblem ?? "", chat);
 
+            w.Section("Time");
+            timeNote = w.AddNote(TimeText());
+            w.AddButton("Reset times", () => { timeLog.Reset(); SaveTime(); RefreshSettingsNotes(); });
+
             w.Section("General");
             w.AddToggle("Start with Windows", null, settings.Startup, v => { settings.Startup = v; Save(); SetStartup(v); });
             w.AddToggle("Update automatically", "Checks this app's GitHub releases two minutes after start and every six hours.",
@@ -638,8 +814,12 @@ namespace Aevalsistant
             w.FormClosed += (s, e) =>
             {
                 settingsWindow = null;
-                updateNote = lidNote = chatNote = null;
+                updateNote = lidNote = chatNote = timeNote = null;
+                watchToggle = doneToggle = asksToggle = null;
+                notifyChoice = null;
                 agentToggles.Clear();
+                appToggles.Clear();
+                picker?.Close();
             };
             settingsWindow = w;
             w.Show();
@@ -665,6 +845,9 @@ namespace Aevalsistant
             if (chatNote != null) chatNote.Text = chatProblem ?? "";
             foreach (var a in Agents.All)
                 if (agentToggles.TryGetValue(a.Id, out var t)) t.Note = AgentStatus(a);
+            foreach (var app in settings.WatchApps)
+                if (appToggles.TryGetValue(app.Name, out var t)) t.Note = AppNote(app);
+            if (timeNote != null) timeNote.Text = TimeText();
         }
 
         // ---- install surface ----------------------------------------------------------
@@ -784,7 +967,7 @@ namespace Aevalsistant
             sweep.Stop();
             updateTimer.Stop();
             if (settings.LidSaved.Length > 0 && LidAction.Restore(settings.LidSaved)) { settings.LidSaved = ""; }
-            if (Directory.Exists(App.Home)) Save();
+            if (Directory.Exists(App.Home)) { Save(); SaveTime(); }
             settingsWindow?.Close();
             lidSleep.Dispose();
             lid?.Dispose();

@@ -40,6 +40,9 @@ final class Session {
     var label = ""                   // fixed name for sessions without a folder (chat apps)
     var pendingText = ""             // the agent's last reply, for agents that send it before Stop
     var workingSince = Date.distantPast
+    var worked: TimeInterval = 0          // total seconds this session has been busy
+    var blockedSince = Date.distantPast   // when the open permission prompt appeared
+    var remindedAt = Date.distantPast     // last "still needs you" reminder
     var subagents: [String: Subagent] = [:]
     private var stoppedEarly = Set<String>()   // async SubagentStop that beat its Start
     private var started = 0
@@ -146,6 +149,7 @@ final class ToastRequest {
     // subagent reported back, or the last background subagent finishing. Settings decide
     // whether these show a card.
     var background = false
+    var turnSeconds: Double = 0   // how long the turn that just ended ran, for "finished" cards
 
     init(kind: ToastKind, title: String, detail: String) {
         self.kind = kind
@@ -254,6 +258,8 @@ final class SessionBook {
             if isStop { s.stopAt = e.at }
         }
 
+        let turn: Double = s.workingSince > Date.distantPast ? now.timeIntervalSince(s.workingSince) : 0
+
         func card(_ kind: ToastKind, _ title: String, _ detail: String, background: Bool) -> ToastRequest {
             let r = ToastRequest(kind: kind, title: title, detail: detail)
             r.sessionId = s.id
@@ -307,6 +313,7 @@ final class SessionBook {
                          background: child || onItsOwn)
             // Only Claude Code's transcript format is known well enough to read the reply from.
             r.wantsSnippet = reply.isEmpty && s.agent == "claude"
+            r.turnSeconds = turn
             return r
 
         case "StopFailure":
@@ -322,10 +329,13 @@ final class SessionBook {
                 s.blocked = false
                 if s.notifiedSincePrompt { return nil }
                 s.notifiedSincePrompt = true
-                return card(.done, s.project + " is waiting", e.message.isEmpty ? "Ready for your next prompt." : e.message, background: child)
+                let r = card(.done, s.project + " is waiting", e.message.isEmpty ? "Ready for your next prompt." : e.message, background: child)
+                r.turnSeconds = turn
+                return r
             }
             if ["permission_prompt", "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"].contains(type) {
                 // Still mid-turn: keep the machine awake, but ask for the human.
+                if !s.blocked { s.blockedSince = now; s.remindedAt = .distantPast }
                 s.blocked = true
                 return card(.needsYou, s.project + " needs you", e.message.isEmpty ? "Claude is asking for permission." : e.message, background: child)
             }
@@ -334,6 +344,29 @@ final class SessionBook {
         default:
             return nil
         }
+    }
+
+    // Adds busy time to every session that is working or has subagents running.
+    func credit(_ seconds: TimeInterval) {
+        guard seconds > 0 else { return }
+        for s in map.values where s.busy { s.worked += seconds }
+    }
+
+    // "Still needs you" cards for prompts left open longer than `every`, at most one per
+    // session per `every`.
+    func reminders(_ now: Date, every: TimeInterval) -> [ToastRequest] {
+        var out: [ToastRequest] = []
+        for s in all where s.blocked && now.timeIntervalSince(max(s.blockedSince, s.remindedAt)) >= every {
+            s.remindedAt = now
+            let r = ToastRequest(kind: .needsYou, title: s.project + " still needs you",
+                                 detail: "It has been waiting " + Status.duration(now.timeIntervalSince(s.blockedSince)) + ".")
+            r.sessionId = s.id
+            r.appPid = s.appPid
+            r.host = s.whereLabel
+            r.background = parentOf(s) != nil
+            out.append(r)
+        }
+        return out
     }
 
     static func guessType(_ message: String) -> String {
@@ -475,6 +508,28 @@ final class Settings {
     var optionTab = true
     var cardTime = 1                // 0 short, 1 normal, 2 long
     var showChildren = true         // list subagents and background sessions under their session
+    // Apps that count as an agent working while they are open.
+    var watchApps: [WatchedApp] = [WatchedApp(name: "blender", label: "Blender", on: true)]
+    var watchAppsOn = true
+    var notifyAway = false          // no card when the agent's app is already in front
+    var minTurn = 0                 // index into minTurnSeconds: finish cards only after longer turns
+    var remind = false              // repeat "needs you" while a prompt stays open
+    var remindAfter = 1             // index into remindMinutes
+
+    static let minTurnSeconds: [Double] = [0, 60, 300, 900]
+    static let remindMinutes: [Double] = [2, 5, 10]
+
+    // The "Notify me" preset: 0 always, 1 only when agents need you, 2 never.
+    var notifyMode: Int {
+        get { !notifyNeedsYou && !notifyDone ? 2 : !notifyDone ? 1 : 0 }
+        set {
+            switch newValue {
+            case 0: notifyDone = true; notifyNeedsYou = true
+            case 1: notifyDone = false; notifyNeedsYou = true
+            default: notifyDone = false; notifyNeedsYou = false
+            }
+        }
+    }
 
     static func load(_ path: String) -> Settings {
         let s = Settings()
@@ -505,6 +560,12 @@ final class Settings {
             case "optionTab": s.optionTab = b
             case "cardTime": if let t = Int(v), (0...2).contains(t) { s.cardTime = t }
             case "children": s.showChildren = b
+            case "watchApps": s.watchApps = WatchedApp.parse(v)
+            case "watchAppsOn": s.watchAppsOn = b
+            case "notifyAway": s.notifyAway = b
+            case "minTurn": if let t = Int(v), (0...3).contains(t) { s.minTurn = t }
+            case "remind": s.remind = b
+            case "remindAfter": if let t = Int(v), (0...2).contains(t) { s.remindAfter = t }
             default: break
             }
         }
@@ -513,15 +574,21 @@ final class Settings {
 
     func save(_ path: String) {
         func b(_ v: Bool) -> String { v ? "1" : "0" }
-        let lines = [
+        var lines: [String] = [
             "hooks=" + b(hooks), "agentsOff=" + agentsOff.sorted().joined(separator: ","), "startup=" + b(startup),
             "awake=" + b(keepAwake), "lid=" + b(lidAwake), "display=" + b(displayOn), "lidSaved=" + lidSaved,
             "welcomed=" + b(welcomed), "chats=" + b(chats), "autoUpdate=" + b(autoUpdate), "lastVersion=" + lastVersion,
             "notifyDone=" + b(notifyDone), "notifyBackgroundDone=" + b(notifyBackgroundDone),
             "notifyNeedsYou=" + b(notifyNeedsYou), "notifyBackgroundNeedsYou=" + b(notifyBackgroundNeedsYou),
             "sound=" + b(sound), "expand=" + b(expandOnHover), "optionTab=" + b(optionTab),
-            "cardTime=" + String(cardTime), "children=" + b(showChildren), "",
+            "cardTime=" + String(cardTime), "children=" + b(showChildren),
         ]
+        // A second literal, so neither one gets long enough to slow the type checker down.
+        let more: [String] = [
+            "watchApps=" + WatchedApp.format(watchApps), "watchAppsOn=" + b(watchAppsOn), "notifyAway=" + b(notifyAway),
+            "minTurn=" + String(minTurn), "remind=" + b(remind), "remindAfter=" + String(remindAfter), "",
+        ]
+        lines += more
         try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
     }
@@ -532,7 +599,9 @@ final class Settings {
         switch r.kind {
         case .info: return true
         case .needsYou: return notifyNeedsYou && (!r.background || notifyBackgroundNeedsYou)
-        case .done: return notifyDone && (!r.background || notifyBackgroundDone)
+        case .done:
+            if minTurn > 0 && r.turnSeconds > 0 && r.turnSeconds < Settings.minTurnSeconds[minTurn] { return false }
+            return notifyDone && (!r.background || notifyBackgroundDone)
         }
     }
 
@@ -556,6 +625,16 @@ enum Status {
         return join("done", age(now.timeIntervalSince(s.lastEvent)), "ago")
     }
 
+    // A length of time for the time totals: "under a minute", "12m", "2h 5m".
+    static func duration(_ t: TimeInterval) -> String {
+        if t < 60 { return "under a minute" }
+        if t < 3600 { return "\(Int(t / 60))m" }
+        return "\(Int(t / 3600))h \(Int(t.truncatingRemainder(dividingBy: 3600) / 60))m"
+    }
+
+    // A session's total busy time: "1h 4m worked", or empty under a minute.
+    static func worked(_ s: Session) -> String { s.worked < 60 ? "" : duration(s.worked) + " worked" }
+
     // A subagent's line: "running 4m".
     static func text(_ a: Subagent, _ now: Date) -> String { join("running", age(now.timeIntervalSince(a.started))) }
 
@@ -567,6 +646,142 @@ enum Status {
 
     private static func join(_ word: String, _ age: String, _ suffix: String = "") -> String {
         age.isEmpty ? word : word + " " + age + (suffix.isEmpty ? "" : " " + suffix)
+    }
+}
+
+// An app that keeps the Mac awake while it is open, as if an agent were working.
+final class WatchedApp {
+    var name: String    // lowercase process or executable name: "blender"
+    var label: String   // shown in Settings and the menu: "Blender"
+    var on: Bool
+
+    init(name: String, label: String, on: Bool) {
+        self.name = name
+        self.label = label
+        self.on = on
+    }
+
+    // "blender|Blender|1,obs|OBS Studio|0"
+    static func parse(_ v: String) -> [WatchedApp] {
+        var out: [WatchedApp] = []
+        for entry in v.split(separator: ",") {
+            let f = entry.split(separator: "|", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard let first = f.first else { continue }
+            let name = first.lowercased()
+            if name.isEmpty || out.contains(where: { $0.name == name }) { continue }
+            let label = f.count > 1 && !f[1].isEmpty ? f[1] : first
+            out.append(WatchedApp(name: name, label: label, on: f.count > 2 ? f[2] != "0" : true))
+        }
+        return out
+    }
+
+    static func format(_ apps: [WatchedApp]) -> String {
+        func clean(_ s: String) -> String { s.replacingOccurrences(of: ",", with: " ").replacingOccurrences(of: "|", with: " ") }
+        return apps.filter { !clean($0.name).trimmingCharacters(in: .whitespaces).isEmpty }
+            .map { clean($0.name) + "|" + clean($0.label) + "|" + ($0.on ? "1" : "0") }
+            .joined(separator: ",")
+    }
+}
+
+// Whether a running process belongs to a watched app: "blender" covers blender, Blender.app,
+// blender.exe, and helpers such as blender-launcher.
+enum WatchMatch {
+    static func matches(_ watch: String, _ process: String) -> Bool {
+        let w = watch.lowercased()
+        if w.isEmpty { return false }
+        var p = process.lowercased()
+        if p.hasSuffix(".exe") || p.hasSuffix(".app") { p = String(p.dropLast(4)) }
+        if p == w { return true }
+        guard p.hasPrefix(w), p.count > w.count else { return false }
+        let next = p[p.index(p.startIndex, offsetBy: w.count)]
+        return next == "-" || next == "_" || next == "." || next == " "
+    }
+}
+
+// Keys in the time log: "agent:claude", "app:blender".
+enum TimeKeys {
+    static func agent(_ id: String) -> String { "agent:" + id }
+    static func app(_ name: String) -> String { "app:" + name }
+
+    static func label(_ key: String, apps: [WatchedApp]) -> String {
+        if key.hasPrefix("agent:") {
+            let id = String(key.dropFirst(6))
+            return id == "chat" ? "Chat apps" : Agents.get(id).name
+        }
+        if key.hasPrefix("app:") {
+            let name = String(key.dropFirst(4))
+            return apps.first { $0.name == name }?.label ?? name
+        }
+        return key
+    }
+}
+
+// Time spent working, per agent and per watched app, for today and for all time. The sweep
+// ticks it; a gap longer than a minute (sleep, a stalled run loop) counts as a minute.
+final class TimeLog {
+    var day = ""
+    var today: [String: Double] = [:]
+    var total: [String: Double] = [:]
+    private var lastTick: Date?
+
+    init() {}
+
+    @discardableResult
+    func tick(_ now: Date, day d: String, active: Set<String>) -> Double {
+        let elapsed = lastTick.map { min(max(0, now.timeIntervalSince($0)), 60) } ?? 0
+        lastTick = now
+        if d != day { day = d; today = [:] }
+        if elapsed > 0 {
+            for k in active {
+                today[k, default: 0] += elapsed
+                total[k, default: 0] += elapsed
+            }
+        }
+        return elapsed
+    }
+
+    func reset() {
+        today = [:]
+        total = [:]
+    }
+
+    static func dayString(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
+    }
+
+    static func load(_ path: String) -> TimeLog {
+        let t = TimeLog()
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return t }
+        for line in text.components(separatedBy: "\n") {
+            guard let eq = line.firstIndex(of: "="), eq != line.startIndex else { continue }
+            let k = line[..<eq].trimmingCharacters(in: .whitespaces)
+            let v = line[line.index(after: eq)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if k == "day" { t.day = v; continue }
+            guard let secs = Double(v), secs >= 0 else { continue }
+            if k.hasPrefix("today.") { t.today[String(k.dropFirst(6))] = secs }
+            else if k.hasPrefix("total.") { t.total[String(k.dropFirst(6))] = secs }
+        }
+        return t
+    }
+
+    func save(_ path: String) {
+        var lines = ["day=" + day]
+        for k in today.keys.sorted() { lines.append("today." + k + "=" + String(Int(today[k] ?? 0))) }
+        for k in total.keys.sorted() { lines.append("total." + k + "=" + String(Int(total[k] ?? 0))) }
+        lines.append("")
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    // "Claude Code 2h 5m, Blender 40m", longest first; entries under a minute are left out.
+    func summary(_ table: [String: Double], label: (String) -> String) -> String {
+        table.filter { $0.value >= 60 }
+            .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            .map { label($0.key) + " " + Status.duration($0.value) }
+            .joined(separator: ", ")
     }
 }
 

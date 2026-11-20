@@ -19,6 +19,8 @@ func claudeApply(_ text: String?, _ command: String?) -> (String, Bool) {
 
 func parseObj(_ s: String) -> JObj { (Json.tryParse(s) as? JObj) ?? JObj() }
 
+func secs(_ table: [String: Double], _ key: String) -> Double { table[key] ?? -1 }
+
 func occurrences(_ s: String, _ of: String) -> Int { s.components(separatedBy: of).count - 1 }
 
 enum CoreTests {
@@ -35,6 +37,9 @@ enum CoreTests {
         settingsDefaults()
         updateAssets()
         easing()
+        watchedApps()
+        timeLog()
+        notifyOptions()
     }
 
     static func jsonRoundTrip() {
@@ -441,6 +446,108 @@ enum CoreTests {
         try? FileManager.default.removeItem(atPath: path)
         let fresh = Settings.load(path)
         check(fresh.displayOn && fresh.lidAwake && !fresh.sound, "defaults: a missing settings file loads the defaults")
+    }
+
+    // Apps that keep the Mac awake while open: Blender by default, saved with their labels.
+    static func watchedApps() {
+        let d = Settings()
+        check(d.watchAppsOn && d.watchApps.count == 1 && d.watchApps[0].name == "blender" && d.watchApps[0].label == "Blender" && d.watchApps[0].on,
+              "watch: Blender is watched by default")
+        let path = NSTemporaryDirectory() + "/aeval-watch-test.ini"
+        let s = Settings()
+        s.watchApps = [WatchedApp(name: "blender", label: "Blender", on: false), WatchedApp(name: "obs", label: "OBS, Studio|x", on: true)]
+        s.watchAppsOn = false
+        s.save(path)
+        let back = Settings.load(path)
+        check(!back.watchAppsOn && back.watchApps.count == 2 && back.watchApps[0].name == "blender" && !back.watchApps[0].on
+              && back.watchApps[1].name == "obs" && back.watchApps[1].label == "OBS  Studio x" && back.watchApps[1].on,
+              "watch: apps, labels, and on/off survive a save and load")
+        try? "awake=1\n".write(toFile: path, atomically: true, encoding: .utf8)
+        check(Settings.load(path).watchApps.map { $0.name } == ["blender"], "watch: a file without the key gets Blender")
+        try? "watchApps=\n".write(toFile: path, atomically: true, encoding: .utf8)
+        check(Settings.load(path).watchApps.isEmpty, "watch: an empty list stays empty")
+        try? "watchApps=Blender|Blender|1,blender|Again|1,|x|1\n".write(toFile: path, atomically: true, encoding: .utf8)
+        check(Settings.load(path).watchApps.map { $0.name } == ["blender"], "watch: names are lowercased, duplicates and blanks dropped")
+
+        check(WatchMatch.matches("blender", "Blender") && WatchMatch.matches("blender", "blender.exe") && WatchMatch.matches("blender", "blender-launcher")
+              && WatchMatch.matches("blender", "Blender.app") && WatchMatch.matches("blender", "blender_softwaregl"),
+              "watch: blender matches its app, exe, and helpers")
+        check(!WatchMatch.matches("blender", "blenderx") && !WatchMatch.matches("blender", "myblender") && !WatchMatch.matches("", "blender"),
+              "watch: other names do not match")
+    }
+
+    static func timeLog() {
+        let t0 = Date(timeIntervalSince1970: 1_791_374_400)
+        let log = TimeLog()
+        check(log.tick(t0, day: "2026-11-20", active: ["agent:claude"]) == 0 && log.today.isEmpty, "time: the first tick counts nothing")
+        check(log.tick(t0.addingTimeInterval(5), day: "2026-11-20", active: ["agent:claude", "app:blender"]) == 5
+              && secs(log.today, "agent:claude") == 5 && secs(log.total, "app:blender") == 5, "time: a tick adds the gap to each active key")
+        check(log.tick(t0.addingTimeInterval(605), day: "2026-11-20", active: ["agent:claude"]) == 60 && secs(log.today, "agent:claude") == 65,
+              "time: a long gap (sleep) counts as a minute")
+        _ = log.tick(t0.addingTimeInterval(610), day: "2026-11-21", active: ["agent:claude"])
+        check(secs(log.today, "agent:claude") == 5 && log.today["app:blender"] == nil && secs(log.total, "agent:claude") == 70, "time: a new day starts today over, not the total")
+
+        let path = NSTemporaryDirectory() + "/aeval-time-test.ini"
+        log.total["app:blender"] = 3725
+        log.save(path)
+        let back = TimeLog.load(path)
+        check(back.day == "2026-11-21" && secs(back.today, "agent:claude") == 5 && secs(back.total, "agent:claude") == 70 && secs(back.total, "app:blender") == 3725,
+              "time: the log survives a save and load")
+        let apps = [WatchedApp(name: "blender", label: "Blender", on: true)]
+        check(back.summary(back.total) { TimeKeys.label($0, apps: apps) } == "Blender 1h 2m, Claude Code 1m", "time: summary is longest first with labels")
+        check(back.summary(back.today) { TimeKeys.label($0, apps: apps) } == "", "time: under a minute is left out")
+        check(TimeKeys.label("agent:chat", apps: []) == "Chat apps" && TimeKeys.label("app:obs", apps: []) == "obs", "time: labels for chat and unknown apps")
+        check(Status.duration(30) == "under a minute" && Status.duration(600) == "10m" && Status.duration(3725) == "1h 2m", "time: durations read naturally")
+        back.reset()
+        check(back.today.isEmpty && back.total.isEmpty, "time: reset clears both")
+
+        let book = SessionBook()
+        _ = book.apply(ev("UserPromptSubmit", at: 1), t0)
+        book.credit(90)
+        check(Status.worked(book.get("s1")!) == "1m worked", "time: busy sessions are credited")
+        _ = book.apply(ev("Stop", at: 2), t0)
+        book.credit(90)
+        check(book.get("s1")!.worked == 90, "time: idle sessions are not credited")
+    }
+
+    static func notifyOptions() {
+        let s = Settings()
+        check(s.notifyMode == 0, "notify: always by default")
+        s.notifyMode = 1
+        check(!s.notifyDone && s.notifyNeedsYou && s.notifyMode == 1, "notify: needs-me-only turns off finish cards")
+        s.notifyMode = 2
+        check(!s.notifyDone && !s.notifyNeedsYou && s.notifyMode == 2, "notify: never turns off both")
+        s.notifyMode = 0
+
+        s.minTurn = 1
+        func done(_ secs: Double) -> ToastRequest {
+            let r = ToastRequest(kind: .done, title: "", detail: "")
+            r.turnSeconds = secs
+            return r
+        }
+        check(!s.wants(done(30)) && s.wants(done(120)) && s.wants(done(0)), "notify: short turns skip the finish card")
+        let ask = ToastRequest(kind: .needsYou, title: "", detail: "")
+        ask.turnSeconds = 5
+        check(s.wants(ask), "notify: the turn length never hides a needs-you card")
+
+        let t0 = Date(timeIntervalSince1970: 1_791_374_400)
+        let book = SessionBook()
+        _ = book.apply(ev("UserPromptSubmit", at: 1), t0)
+        let stop = book.apply(ev("Stop", at: 2), t0.addingTimeInterval(200))
+        check(stop != nil && abs(stop!.turnSeconds - 200) < 0.01, "notify: a finish card carries the turn length")
+
+        _ = book.apply(ev("UserPromptSubmit", at: 3), t0)
+        _ = book.apply(ev("Notification", msg: "Claude needs your permission", type: "permission_prompt"), t0)
+        check(book.reminders(t0.addingTimeInterval(100), every: 120).isEmpty, "remind: not before the interval")
+        let first = book.reminders(t0.addingTimeInterval(130), every: 120)
+        check(first.count == 1 && first[0].kind == .needsYou && first[0].title == "aevalrena still needs you" && first[0].detail == "It has been waiting 2m.",
+              "remind: a reminder after the interval")
+        check(book.reminders(t0.addingTimeInterval(200), every: 120).isEmpty, "remind: not again right away")
+        check(book.reminders(t0.addingTimeInterval(260), every: 120).count == 1, "remind: again after another interval")
+        _ = book.apply(ev("Notification", msg: "Claude needs your permission", type: "permission_prompt"), t0.addingTimeInterval(270))
+        check(book.reminders(t0.addingTimeInterval(300), every: 120).isEmpty, "remind: a second prompt while blocked keeps the clock")
+        _ = book.apply(ev("Stop", at: 4), t0.addingTimeInterval(400))
+        check(book.reminders(t0.addingTimeInterval(1000), every: 120).isEmpty, "remind: nothing once the session moves on")
     }
 
     // The shape of api.github.com/repos/{repo}/releases/latest, trimmed to what the updater reads.

@@ -15,6 +15,14 @@ features, the major number for changes that need you to do something.
 - On the Mac, Option-Tab jumps to the agent while a card is up, and "Keep working with the lid
   closed" asks for your password once so it can turn sleep off while agents work.
 - The Mac app starts with the screen kept on, the lid option on, and the sound off.
+- Apps can keep the computer awake too: while Blender, or any app you add, is open, it counts as an
+  agent working, including the screen and lid options. **Add an app** in Settings searches the apps
+  running now, and the list is saved.
+- Time tracking: the menu shows how long each session has worked and today's totals per agent and
+  per watched app; Settings shows today and all time, with a reset button.
+- More control over cards: "Notify me" (always, when needed, never), finish cards only after turns
+  longer than 1, 5, or 15 minutes, reminders every few minutes while an agent still needs you, and
+  no card when you are already looking at that agent's window.
 
 ## [1.4.0] - 2026-10-08
 

@@ -47,6 +47,8 @@ namespace Aevalsistant
         public string PendingText = "";   // the agent's last reply, for agents that send it before Stop
         public string Where => Agents.Where(Agent, Host);
         public DateTime WorkingSince;     // when the current turn started
+        public double Worked;             // seconds spent busy since this app first saw the session
+        public DateTime BlockedSince, RemindedAt;   // when the open permission prompt appeared, and the last reminder for it
         public readonly Dictionary<string, Subagent> Subagents = new Dictionary<string, Subagent>();
         readonly HashSet<string> stoppedEarly = new HashSet<string>();   // async SubagentStop that beat its Start
         public bool Busy => State == AgentState.Working || Subagents.Count > 0;
@@ -144,6 +146,7 @@ namespace Aevalsistant
         // subagent reported back, or the last background subagent finishing. Settings decide
         // whether these show a card.
         public bool Background;
+        public double TurnSeconds;   // how long the turn that just ended took, when known
     }
 
     sealed class SessionBook
@@ -274,7 +277,7 @@ namespace Aevalsistant
                     s.PendingText = "";
                     return new ToastRequest
                     {
-                        SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done, Background = child || onItsOwn,
+                        SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done, Background = child || onItsOwn, TurnSeconds = TurnLength(s, now),
                         Title = s.Project + (s.Subagents.Count > 0 ? " is waiting" : " finished"),
                         Detail = reply.Length > 0 || s.Agent == "claude" ? Snippet.Clean(reply) : "Ready for your next prompt.",
                         // Only Claude Code's transcript format is known well enough to read the reply from.
@@ -302,7 +305,7 @@ namespace Aevalsistant
                         s.NotifiedSincePrompt = true;
                         return new ToastRequest
                         {
-                            SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done, Background = child,
+                            SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.Done, Background = child, TurnSeconds = TurnLength(s, now),
                             Title = s.Project + " is waiting",
                             Detail = e.Message.Length > 0 ? e.Message : "Ready for your next prompt.",
                         };
@@ -310,6 +313,7 @@ namespace Aevalsistant
                     if (type == "permission_prompt" || type == "elicitation_dialog" || type == "elicitation_url_dialog" || type == "agent_needs_input")
                     {
                         // Still mid-turn: keep the machine awake, but ask for the human.
+                        if (!s.Blocked) { s.BlockedSince = now; s.RemindedAt = DateTime.MinValue; }
                         s.Blocked = true;
                         return new ToastRequest
                         {
@@ -321,6 +325,35 @@ namespace Aevalsistant
                     return null;
             }
             return null;
+        }
+
+        static double TurnLength(Session s, DateTime now) =>
+            s.WorkingSince > DateTime.MinValue ? Math.Max(0, (now - s.WorkingSince).TotalSeconds) : 0;
+
+        // Adds time to every busy session's total.
+        public void Credit(double seconds)
+        {
+            foreach (var s in map.Values) if (s.Busy) s.Worked += seconds;
+        }
+
+        // A card again for each session still waiting on a permission prompt, once per interval.
+        public List<ToastRequest> Reminders(DateTime now, TimeSpan every)
+        {
+            var list = new List<ToastRequest>();
+            foreach (var s in All.ToList())
+            {
+                if (!s.Blocked) continue;
+                var last = s.RemindedAt > s.BlockedSince ? s.RemindedAt : s.BlockedSince;
+                if (now - last < every) continue;
+                s.RemindedAt = now;
+                list.Add(new ToastRequest
+                {
+                    SessionId = s.Id, Hwnd = s.Hwnd, Host = s.Where, Kind = ToastKind.NeedsYou, Background = ParentOf(s) != null,
+                    Title = s.Project + " still needs you",
+                    Detail = "It has been waiting " + Status.Duration((now - s.BlockedSince).TotalSeconds) + ".",
+                });
+            }
+            return list;
         }
 
         static string GuessType(string message)
@@ -518,6 +551,23 @@ namespace Aevalsistant
         public bool AltTab = true;
         public int CardTime = 1;          // 0 short, 1 normal, 2 long
         public bool ShowChildren = true;  // list subagents and background sessions under their session
+        // Apps that keep the PC awake while they are open, as if an agent were working.
+        public readonly List<WatchedApp> WatchApps = new List<WatchedApp> { new WatchedApp { Name = "blender", Label = "Blender", On = true } };
+        public bool WatchAppsOn = true;
+        public bool NotifyAway;           // no card when the agent's window is already in front
+        public int MinTurn;               // index into MinTurnSeconds: finish cards only after longer turns
+        public bool Remind;               // repeat the card while an agent still needs you
+        public int RemindAfter = 1;       // index into RemindMinutes
+
+        public static readonly double[] MinTurnSeconds = { 0, 60, 300, 900 };
+        public static readonly double[] RemindMinutes = { 2, 5, 10 };
+
+        // The "Notify me" choice: always, only when agents need you, or never.
+        public int NotifyMode
+        {
+            get => !NotifyNeedsYou && !NotifyDone ? 2 : !NotifyDone ? 1 : 0;
+            set { NotifyDone = value == 0; NotifyNeedsYou = value != 2; }
+        }
 
         public static Settings Load(string path)
         {
@@ -551,6 +601,12 @@ namespace Aevalsistant
                     case "altTab": s.AltTab = b; break;
                     case "cardTime": if (int.TryParse(v, out int t) && t >= 0 && t <= 2) s.CardTime = t; break;
                     case "children": s.ShowChildren = b; break;
+                    case "watchApps": s.WatchApps.Clear(); s.WatchApps.AddRange(WatchedApp.ParseList(v)); break;
+                    case "watchAppsOn": s.WatchAppsOn = b; break;
+                    case "notifyAway": s.NotifyAway = b; break;
+                    case "minTurn": if (int.TryParse(v, out int m) && m >= 0 && m < MinTurnSeconds.Length) s.MinTurn = m; break;
+                    case "remind": s.Remind = b; break;
+                    case "remindAfter": if (int.TryParse(v, out int ra) && ra >= 0 && ra < RemindMinutes.Length) s.RemindAfter = ra; break;
                 }
             }
             return s;
@@ -568,7 +624,10 @@ namespace Aevalsistant
                 "notifyDone=" + B(NotifyDone), "notifyBackgroundDone=" + B(NotifyBackgroundDone),
                 "notifyNeedsYou=" + B(NotifyNeedsYou), "notifyBackgroundNeedsYou=" + B(NotifyBackgroundNeedsYou),
                 "sound=" + B(Sound), "expand=" + B(ExpandOnHover), "altTab=" + B(AltTab),
-                "cardTime=" + CardTime.ToString(CultureInfo.InvariantCulture), "children=" + B(ShowChildren), "",
+                "cardTime=" + CardTime.ToString(CultureInfo.InvariantCulture), "children=" + B(ShowChildren),
+                "watchApps=" + WatchedApp.FormatList(WatchApps), "watchAppsOn=" + B(WatchAppsOn), "notifyAway=" + B(NotifyAway),
+                "minTurn=" + MinTurn.ToString(CultureInfo.InvariantCulture), "remind=" + B(Remind),
+                "remindAfter=" + RemindAfter.ToString(CultureInfo.InvariantCulture), "",
             }));
         }
 
@@ -577,7 +636,8 @@ namespace Aevalsistant
         public bool Wants(ToastRequest r) =>
             r.Kind == ToastKind.Info
             || (r.Kind == ToastKind.NeedsYou ? NotifyNeedsYou && (!r.Background || NotifyBackgroundNeedsYou)
-                                             : NotifyDone && (!r.Background || NotifyBackgroundDone));
+                                             : NotifyDone && (!r.Background || NotifyBackgroundDone)
+                                               && !(MinTurn > 0 && r.TurnSeconds > 0 && r.TurnSeconds < MinTurnSeconds[MinTurn]));
 
         // Seconds a card stays up while you are at the keyboard.
         public double Seconds(ToastKind kind)
@@ -603,6 +663,15 @@ namespace Aevalsistant
             return Join("done", Age(now - s.LastEvent), "ago");
         }
 
+        // "1h 4m worked", or nothing under a minute.
+        public static string Worked(Session s) => s.Worked < 60 ? "" : Duration(s.Worked) + " worked";
+
+        public static string Duration(double seconds)
+        {
+            var t = TimeSpan.FromSeconds(Math.Max(0, seconds));
+            return t.TotalMinutes < 1 ? "under a minute" : t.TotalHours < 1 ? (int)t.TotalMinutes + "m" : (int)t.TotalHours + "h " + t.Minutes + "m";
+        }
+
         // A subagent's line: "running 4m".
         public static string Text(Subagent a, DateTime now) => Join("running", Age(now - a.Started));
 
@@ -611,6 +680,140 @@ namespace Aevalsistant
 
         static string Join(string word, string age, string suffix = "") =>
             age.Length == 0 ? word : word + " " + age + (suffix.Length > 0 ? " " + suffix : "");
+    }
+
+    // An app that keeps the PC awake while it is open. Name is the process name in lower case
+    // ("blender"); Label is what Settings shows ("Blender").
+    sealed class WatchedApp
+    {
+        public string Name = "";
+        public string Label = "";
+        public bool On = true;
+
+        // "blender|Blender|1,obs64|OBS Studio|0"
+        public static List<WatchedApp> ParseList(string v)
+        {
+            var list = new List<WatchedApp>();
+            foreach (var entry in (v ?? "").Split(','))
+            {
+                var f = entry.Split('|');
+                string name = f[0].Trim().ToLowerInvariant();
+                if (name.Length == 0 || list.Any(a => a.Name == name)) continue;
+                list.Add(new WatchedApp
+                {
+                    Name = name,
+                    Label = f.Length > 1 && f[1].Trim().Length > 0 ? f[1].Trim() : name,
+                    On = f.Length < 3 || f[2].Trim() != "0",
+                });
+            }
+            return list;
+        }
+
+        public static string FormatList(IEnumerable<WatchedApp> apps)
+        {
+            string Clean(string x) => (x ?? "").Replace(",", " ").Replace("|", " ").Trim();
+            return string.Join(",", apps.Where(a => Clean(a.Name).Length > 0)
+                .Select(a => Clean(a.Name) + "|" + Clean(a.Label) + "|" + (a.On ? "1" : "0")));
+        }
+    }
+
+    static class WatchMatch
+    {
+        // "blender" matches blender, Blender.exe, blender-launcher and Blender.app, so every part
+        // of an app counts as it being open.
+        public static bool Matches(string watch, string process)
+        {
+            string w = (watch ?? "").Trim().ToLowerInvariant(), p = (process ?? "").Trim().ToLowerInvariant();
+            if (w.Length == 0 || p.Length == 0) return false;
+            if (p.EndsWith(".exe", StringComparison.Ordinal) || p.EndsWith(".app", StringComparison.Ordinal)) p = p.Substring(0, p.Length - 4);
+            if (p == w) return true;
+            return p.Length > w.Length && p.StartsWith(w, StringComparison.Ordinal) && "-_. ".IndexOf(p[w.Length]) >= 0;
+        }
+    }
+
+    // Time keys: "agent:claude", "app:blender".
+    static class TimeKeys
+    {
+        public static string Agent(string id) => "agent:" + id;
+        public static string App(string name) => "app:" + name;
+
+        public static string Label(string key, IEnumerable<WatchedApp> apps)
+        {
+            if (key.StartsWith("agent:", StringComparison.Ordinal))
+            {
+                string id = key.Substring(6);
+                return id == "chat" ? "Chat apps" : Agents.Get(id).Name;
+            }
+            if (key.StartsWith("app:", StringComparison.Ordinal))
+            {
+                string name = key.Substring(4);
+                return apps.FirstOrDefault(a => a.Name == name)?.Label ?? name;
+            }
+            return key;
+        }
+    }
+
+    // Seconds each kind of agent spent working and each watched app stayed open: today and in total.
+    sealed class TimeLog
+    {
+        public const double MaxStep = 60;   // a longer gap is sleep or a stalled app, not work
+
+        public string Day = "";
+        public readonly Dictionary<string, double> Today = new Dictionary<string, double>();
+        public readonly Dictionary<string, double> Total = new Dictionary<string, double>();
+        DateTime? lastTick;
+
+        // Returns the seconds credited to each active key.
+        public double Tick(DateTime now, string day, IEnumerable<string> active)
+        {
+            double dt = lastTick == null ? 0 : Math.Min(MaxStep, Math.Max(0, (now - lastTick.Value).TotalSeconds));
+            lastTick = now;
+            if (day != Day) { Day = day; Today.Clear(); }
+            foreach (var k in active.Distinct())
+            {
+                Today[k] = (Today.TryGetValue(k, out var a) ? a : 0) + dt;
+                Total[k] = (Total.TryGetValue(k, out var b) ? b : 0) + dt;
+            }
+            return dt;
+        }
+
+        public void Reset() { Today.Clear(); Total.Clear(); }
+
+        public static string DayString(DateTime local) => local.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+        // "Claude Code 2h 5m, Blender 1h 10m", longest first; empty when nothing reached a minute.
+        public static string Summary(Dictionary<string, double> table, Func<string, string> label) =>
+            string.Join(", ", table.Where(kv => kv.Value >= 60)
+                .OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => label(kv.Key) + " " + Status.Duration(kv.Value)));
+
+        public static TimeLog Load(string path)
+        {
+            var log = new TimeLog();
+            if (!File.Exists(path)) return log;
+            foreach (var line in File.ReadAllLines(path))
+            {
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                string k = line.Substring(0, eq).Trim(), v = line.Substring(eq + 1).Trim();
+                if (k == "day") { log.Day = v; continue; }
+                if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out double secs)) continue;
+                if (k.StartsWith("today.", StringComparison.Ordinal)) log.Today[k.Substring(6)] = secs;
+                else if (k.StartsWith("total.", StringComparison.Ordinal)) log.Total[k.Substring(6)] = secs;
+            }
+            return log;
+        }
+
+        public void Save(string path)
+        {
+            string N(double v) => Math.Round(v).ToString(CultureInfo.InvariantCulture);
+            var lines = new List<string> { "day=" + Day };
+            foreach (var kv in Today.OrderBy(kv => kv.Key, StringComparer.Ordinal)) lines.Add("today." + kv.Key + "=" + N(kv.Value));
+            foreach (var kv in Total.OrderBy(kv => kv.Key, StringComparer.Ordinal)) lines.Add("total." + kv.Key + "=" + N(kv.Value));
+            lines.Add("");
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.WriteAllText(path, string.Join("\n", lines));
+        }
     }
 
     static class Plural

@@ -34,7 +34,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var updateNote: Note?, lidNote: Note?, chatNote: Note?
     private var lidToggle: Toggle?
     private var agentToggles: [String: Toggle] = [:]
+    private var watchToggle: Toggle?, doneToggle: Toggle?, asksToggle: Toggle?
+    private var notifyChoice: Choice?
+    private var appToggles: [String: Toggle] = [:]
+    private var timeNote: Note?
+    private var picker: AppPicker?
     private var quitting = false
+    private let timeLog = TimeLog.load(AppPaths.time)
+    private var appsOpen: [String: Date] = [:]   // watched app name -> when it was first seen open
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         toast.expandOnHover = settings.expandOnHover
@@ -57,6 +64,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         statusItem.menu = menu
+        scanApps()
+        let start = Date()
+        timeLog.tick(start, day: TimeLog.dayString(start), active: [])
         refreshState()
 
         let sweep = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.sweep() }
@@ -136,7 +146,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let root = Agents.entry(
             ("version", Updater.currentText), ("busy", JNum(book.busyCount)), ("sessions", sessions),
             ("card", toast.showing ? toast.title : ""), ("keepAwake", awake.systemOn), ("screenOn", awake.displayOn),
-            ("lidOverride", !settings.lidSaved.isEmpty), ("agents", agents),
+            ("lidOverride", !settings.lidSaved.isEmpty), ("agents", agents), ("apps", JArr(appsOpen.keys.sorted() as [Any])),
             ("problems", JArr((Array(agentProblems.values) + [socketProblem, lidProblem, chatProblem, startupProblem].compactMap { $0 }) as [Any])))
         return Json.write(root) + "\n"
     }
@@ -162,7 +172,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // ---- cards ------------------------------------------------------------------------
 
     private func enqueue(_ req: ToastRequest) {
-        guard settings.wants(req) else {
+        guard settings.wants(req), !lookingAt(req) else {
             // No card for this, but the list under a card already showing stays current.
             if toast.showing { showTop(restart: false) }
             return
@@ -185,6 +195,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if settings.sound { Sound.play(req.kind) }
         showTop()
+    }
+
+    // With "Only when I'm not looking at the agent" on, no card for a session whose app is
+    // already in front.
+    private func lookingAt(_ req: ToastRequest) -> Bool {
+        guard settings.notifyAway, req.kind != .info else { return false }
+        let pid = book.get(req.sessionId)?.appPid ?? req.appPid
+        return pid != 0 && NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
     }
 
     // The main row is the newest status change; under it, every other session this app knows
@@ -250,6 +268,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Accessibility access can be granted at any time; chat watching starts once it is.
         if settings.chats && chats == nil && AXIsProcessTrusted() { startChats(); refreshSettingsNotes() }
         tryApplyUpdate()
+        let now = Date()
+        let appsChanged = scanApps()
+        var active = Set<String>()
+        for s in book.all where s.busy { active.insert(TimeKeys.agent(s.agent)) }
+        for name in appsOpen.keys { active.insert(TimeKeys.app(name)) }
+        book.credit(timeLog.tick(now, day: TimeLog.dayString(now), active: active))
+        if sweeps % 12 == 0 { timeLog.save(AppPaths.time) }
         let fm = FileManager.default
         func mtime(_ path: String) -> Date? { (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date }
         let changed = book.sweep(Date(), alive: { Terminals.isAlive($0.pid, $0.pidStart) }, probe: { s in
@@ -264,7 +289,44 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let before = pending.count
         pending.removeAll { $0.sessionId != nil && book.get($0.sessionId) == nil }
         if pending.count != before { if pending.isEmpty { toast.hide() } else if toast.showing { showTop() } }
-        if changed { refreshState(); if toast.showing { showTop(restart: false) } }
+        if changed { refreshState(); if toast.showing { showTop(restart: false) } } else if appsChanged { refreshState() }
+        if settings.remind {
+            for r in book.reminders(now, every: Settings.remindMinutes[settings.remindAfter] * 60) { enqueue(r) }
+        }
+        refreshTimeNotes()
+    }
+
+    // Which watched apps are open now. An app counts while any running app's executable, name,
+    // or the last part of its bundle id matches it. Returns true when the set changed.
+    @discardableResult
+    private func scanApps() -> Bool {
+        var next: [String: Date] = [:]
+        let watched: [WatchedApp] = settings.watchAppsOn ? settings.watchApps.filter { $0.on } : []
+        if !watched.isEmpty {
+            var names: [String] = []
+            for app in NSWorkspace.shared.runningApplications {
+                if let exe = app.executableURL?.lastPathComponent { names.append(exe) }
+                if let n = app.localizedName { names.append(n) }
+                if let b = app.bundleIdentifier, let last = b.split(separator: ".").last { names.append(String(last)) }
+            }
+            let now = Date()
+            for w in watched where names.contains(where: { WatchMatch.matches(w.name, $0) }) {
+                next[w.name] = appsOpen[w.name] ?? now
+            }
+        }
+        let changed = Set(next.keys) != Set(appsOpen.keys)
+        appsOpen = next
+        return changed
+    }
+
+    // "2 agents working, Blender open", or empty when nothing keeps the Mac awake.
+    private func awakeReason() -> String {
+        var parts: [String] = []
+        let working = book.busyCount
+        if working > 0 { parts.append("\(Plural.agents(working)) working") }
+        let open = settings.watchApps.filter { appsOpen[$0.name] != nil }.map { $0.label }
+        if !open.isEmpty { parts.append(open.joined(separator: ", ") + " open") }
+        return parts.joined(separator: ", ")
     }
 
     private func startChats() {
@@ -324,8 +386,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshState() {
         tryApplyUpdate()
-        let working = book.busyCount
-        let on = working > 0
+        let on = book.busyCount > 0 || !appsOpen.isEmpty
         let keep = on && settings.keepAwake
         awake.set(system: keep, display: keep && settings.displayOn)
 
@@ -361,14 +422,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             trayAwake = on
             statusItem?.button?.image = Theme.menuGlyph(awake: on)
         }
-        statusItem?.button?.toolTip = keep ? "Aevalsistant: keeping awake, \(Plural.agents(working)) working"
-            : on ? "Aevalsistant: \(Plural.agents(working)) working, sleep allowed"
+        statusItem?.button?.toolTip = keep ? "Aevalsistant: keeping awake, " + awakeReason()
+            : on ? "Aevalsistant: " + awakeReason() + ", sleep allowed"
             : "Aevalsistant: idle, sleep allowed"
     }
 
     private func sleepIfLidStillShut() {
         lidSleep = nil
-        if book.busyCount > 0 || !Lid.closed { return }
+        if book.busyCount > 0 || !appsOpen.isEmpty || !Lid.closed { return }
         Lid.sleepNow()
     }
 
@@ -399,11 +460,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func buildMenu() {
         menu.removeAllItems()
-        let working = book.busyCount
+        let reason = awakeReason()
         menu.addItem(label("Aevalsistant " + Updater.currentText, bold: true))
-        menu.addItem(label(working == 0 ? "Idle. Sleep is allowed."
-            : settings.keepAwake ? "Keeping awake: \(Plural.agents(working)) working"
-            : "\(Plural.agents(working)) working. Sleep is allowed."))
+        menu.addItem(label(reason.isEmpty ? "Idle. Sleep is allowed."
+            : settings.keepAwake ? "Keeping awake: " + reason
+            : reason + ". Sleep is allowed."))
         menu.addItem(.separator())
 
         // Every session, with what it started indented under it.
@@ -417,7 +478,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let text = row.host.isEmpty ? row.name : row.name + "  ·  " + row.host
             let item = NSMenuItem(title: text, action: #selector(menuFocus(_:)), keyEquivalent: "")
             item.target = self
-            item.attributedTitle = sessionTitle(text, row.status)
+            var status = row.status
+            if r.subagent == nil {
+                let worked = Status.worked(r.session)
+                if !worked.isEmpty { status += "  ·  " + worked }
+            }
+            item.attributedTitle = sessionTitle(text, status)
             item.image = Theme.dot(r.depth > 0 ? 13 : 16, color, hollow: row.state == .working)
             item.indentationLevel = r.depth
             item.isEnabled = canFocus(row.sessionId, row.appPid)
@@ -426,6 +492,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         }
         if tree.count > maxItems { menu.addItem(label("\(tree.count - maxItems) more")) }
+        // Watched apps that are keeping the Mac awake, and today's time.
+        for a in settings.watchApps {
+            guard let since = appsOpen[a.name] else { continue }
+            let item = label(a.label + "  ·  open " + Status.duration(now.timeIntervalSince(since)))
+            item.image = Theme.dot(16, Theme.slate, hollow: true)
+            menu.addItem(item)
+        }
+        let today = timeLog.summary(timeLog.today) { timeLabel($0) }
+        if !today.isEmpty { menu.addItem(label("Today: " + today)) }
         menu.addItem(.separator())
 
         // Things that need doing stay visible here; everything else lives in Settings.
@@ -513,14 +588,53 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             lidNote = w.addNote(lidProblem ?? "", under: lidToggle)
         }
+        let watch = w.addToggle("Also while these apps are open",
+                                "Counts as an agent working: the Mac stays awake and the screen and lid settings apply.",
+                                settings.watchAppsOn, under: keep) { [self] v in
+            settings.watchAppsOn = v
+            save()
+            scanApps()
+            refreshState()
+            refreshTimeNotes()
+        }
+        watchToggle = watch
+        appToggles.removeAll()
+        for a in settings.watchApps {
+            appToggles[a.name] = w.addToggle(a.label, appNote(a), a.on, under: watch, appChanged(a))
+        }
+        w.addButton("Add an app…", under: watch) { [self] in openPicker() }
 
         w.section("Notifications")
-        let done = w.addToggle("Show a card when an agent finishes", nil, settings.notifyDone) { [self] v in settings.notifyDone = v; save() }
+        notifyChoice = w.addChoice("Notify me", ["Always", "When needed", "Never"], settings.notifyMode) { [self] i in
+            settings.notifyMode = i
+            save()
+            doneToggle?.on = settings.notifyDone
+            asksToggle?.on = settings.notifyNeedsYou
+        }
+        let done = w.addToggle("Show a card when an agent finishes", nil, settings.notifyDone) { [self] v in
+            settings.notifyDone = v; save(); notifyChoice?.selected = settings.notifyMode
+        }
+        doneToggle = done
         w.addToggle("Also when background agents finish", "Subagents, and agents that another agent started.",
                     settings.notifyBackgroundDone, under: done) { [self] v in settings.notifyBackgroundDone = v; save() }
-        let asks = w.addToggle("Show a card when an agent needs you", nil, settings.notifyNeedsYou) { [self] v in settings.notifyNeedsYou = v; save() }
+        w.addChoice("Only after turns longer than", ["Any", "1 min", "5 min", "15 min"], settings.minTurn, under: done) { [self] i in
+            settings.minTurn = i; save()
+        }
+        let asks = w.addToggle("Show a card when an agent needs you", nil, settings.notifyNeedsYou) { [self] v in
+            settings.notifyNeedsYou = v; save(); notifyChoice?.selected = settings.notifyMode
+        }
+        asksToggle = asks
         w.addToggle("Also when a background agent needs you", nil, settings.notifyBackgroundNeedsYou, under: asks) { [self] v in
             settings.notifyBackgroundNeedsYou = v; save()
+        }
+        let remind = w.addToggle("Remind me while an agent still needs you", nil, settings.remind, under: asks) { [self] v in
+            settings.remind = v; save()
+        }
+        w.addChoice("Remind every", ["2 min", "5 min", "10 min"], settings.remindAfter, under: remind) { [self] i in
+            settings.remindAfter = i; save()
+        }
+        w.addToggle("Only when I'm not looking at the agent", "No card when the agent's app is already in front.", settings.notifyAway) { [self] v in
+            settings.notifyAway = v; save()
         }
         let sound = w.addToggle("Play a sound", "A soft chime with each card. Quiet while an app is full screen.", settings.sound) { [self] v in
             settings.sound = v; save()
@@ -566,6 +680,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(u) }
         }
 
+        w.section("Time")
+        timeNote = w.addNote(timeText())
+        w.addButton("Reset times") { [self] in
+            timeLog.reset()
+            timeLog.save(AppPaths.time)
+            refreshTimeNotes()
+        }
+
         w.section("General")
         w.addToggle("Open at login", nil, settings.startup) { [self] v in settings.startup = v; save(); setStartup(v); refreshSettingsNotes() }
         w.addToggle("Update automatically", "Checks this app's GitHub releases two minutes after start and every six hours.",
@@ -583,12 +705,94 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.chatNote = nil
             self?.lidToggle = nil
             self?.agentToggles.removeAll()
+            self?.watchToggle = nil
+            self?.doneToggle = nil
+            self?.asksToggle = nil
+            self?.notifyChoice = nil
+            self?.appToggles.removeAll()
+            self?.timeNote = nil
+            self?.picker?.close()
         }
         settingsWindow = w
         w.present()
     }
 
     private func updateLine() -> String { updateStatus ?? "Version " + Updater.currentText }
+
+    // ---- watched apps and time ----------------------------------------------------------
+
+    private func timeLabel(_ key: String) -> String { TimeKeys.label(key, apps: settings.watchApps) }
+
+    private func timeText() -> String {
+        let today = timeLog.summary(timeLog.today) { timeLabel($0) }
+        let total = timeLog.summary(timeLog.total) { timeLabel($0) }
+        return "Today: " + (today.isEmpty ? "nothing yet" : today) + "\nAll time: " + (total.isEmpty ? "nothing yet" : total)
+    }
+
+    private func appNote(_ a: WatchedApp) -> String {
+        guard let since = appsOpen[a.name] else { return a.on ? "Not open" : "Off" }
+        let open = Date().timeIntervalSince(since)
+        return open < 60 ? "Open" : "Open " + Status.duration(open)
+    }
+
+    private func appChanged(_ a: WatchedApp) -> (Bool) -> Void {
+        return { [self] v in
+            a.on = v
+            save()
+            scanApps()
+            refreshState()
+            refreshTimeNotes()
+        }
+    }
+
+    // The time totals and each app's open/not open line, while Settings is up.
+    private func refreshTimeNotes() {
+        guard settingsWindow != nil else { return }
+        timeNote?.text = timeText()
+        for a in settings.watchApps { appToggles[a.name]?.note = appNote(a) }
+    }
+
+    private func openPicker() {
+        if let p = picker {
+            NSApp.activate(ignoringOtherApps: true)
+            p.makeKeyAndOrderFront(nil)
+            return
+        }
+        let p = AppPicker(isWatched: { [weak self] name in self?.settings.watchApps.contains { $0.name == name } ?? false },
+                          onAdd: { [weak self] name, label in self?.addWatched(name, label) },
+                          onRemove: { [weak self] name in self?.removeWatched(name) })
+        p.onClose = { [weak self] in self?.picker = nil }
+        picker = p
+        p.present(near: settingsWindow)
+    }
+
+    private func addWatched(_ name: String, _ label: String) {
+        if let a = settings.watchApps.first(where: { $0.name == name }) {
+            a.on = true
+            appToggles[name]?.on = true
+        } else {
+            let a = WatchedApp(name: name, label: label, on: true)
+            // After the last app's row, so the "Add an app…" button stays under the list.
+            let anchor = settings.watchApps.compactMap { appToggles[$0.name] }.last ?? watchToggle
+            settings.watchApps.append(a)
+            if let w = settingsWindow, let anchor = anchor {
+                appToggles[name] = w.insertToggle(afterRowOf: anchor, a.label, appNote(a), true, under: watchToggle, appChanged(a))
+            }
+        }
+        save()
+        scanApps()
+        refreshState()
+        refreshTimeNotes()
+    }
+
+    private func removeWatched(_ name: String) {
+        settings.watchApps.removeAll { $0.name == name }
+        if let t = appToggles.removeValue(forKey: name) { settingsWindow?.remove(t) }
+        save()
+        scanApps()
+        refreshState()
+        refreshTimeNotes()
+    }
 
     private func agentStatus(_ a: AgentSpec) -> String {
         if let problem = agentProblems[a.id] { return problem }
@@ -604,6 +808,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lidNote?.text = lidProblem ?? ""
         chatNote?.text = settings.chats ? (chatProblem ?? "") : ""
         for a in Agents.all { agentToggles[a.id]?.note = agentStatus(a) }
+        refreshTimeNotes()
     }
 
     // ---- install surface ----------------------------------------------------------
@@ -706,6 +911,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sweepTimer?.invalidate()
         updateTimer?.invalidate()
         lidSleep?.invalidate()
+        if FileManager.default.fileExists(atPath: AppPaths.home) { timeLog.save(AppPaths.time) }
         if !settings.lidSaved.isEmpty, Lid.setSleepDisabled(false) == nil {
             settings.lidSaved = ""
             if FileManager.default.fileExists(atPath: AppPaths.home) { save() }
@@ -719,6 +925,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cleanUpForQuit()
         if saving && FileManager.default.fileExists(atPath: AppPaths.home) { save() }
         settingsWindow?.close()
+        picker?.close()
         toast.hide()
         NSApp.terminate(nil)
     }

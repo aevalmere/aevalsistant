@@ -99,8 +99,24 @@ input" command, with no start signal), and Cline (its hook format could not be c
   still shut a minute after the agents finish, the app runs the saved action itself (sleep or
   hibernate).
 - **Settings.** `src/SettingsWindow.cs` is a themed page of toggles, choices, buttons, and notes;
-  a row added with a parent toggle is indented under it and shown only while it is on. `TrayApp`
-  fills it in and applies each change at once; `settings.ini` stores it.
+  a row added with a parent toggle is indented under it and shown only while it is on. Toggles can
+  also be inserted after another row and removed while the window is open, for the watched-app
+  list. `TrayApp` fills it in and applies each change at once; `settings.ini` stores it.
+- **Watched apps.** `Settings.WatchApps` holds process names with a label and a switch (`blender`
+  by default). Each sweep lists running process names and matches them with `WatchMatch`, which
+  accepts the name itself, `.exe`/`.app` suffixes, and names that continue with `-`, `_`, `.` or a
+  space (`blender-launcher`). An open watched app counts like a busy session for the power request,
+  the screen and lid options, and the lid sleep timer, but not for the updater, which still waits
+  for agents only. `src/AppPicker.cs` lists running apps (windowed first; typing also matches
+  background processes) and adds or removes them.
+- **Time.** Each sweep, `TimeLog.Tick` credits the time since the last sweep, capped at a minute so
+  sleep does not count, to `agent:<id>` for each busy session's agent and `app:<name>` for each open
+  watched app, today and in total. `SessionBook.Credit` adds the same step to each busy session's
+  `Worked`. `time.ini` stores the totals, saved every minute and on quit.
+- **Notification filters.** `Settings.Wants` also drops finish cards for turns shorter than the
+  chosen minimum (`ToastRequest.TurnSeconds`, set on Stop and idle). "Only when I'm not looking"
+  is checked in `TrayApp.Enqueue` against the foreground window. `SessionBook.Reminders` returns a
+  "still needs you" card per blocked session once per interval, timed from `BlockedSince`.
 - **Sound.** `src/Sound.cs` plays one of two embedded WAVs when a card appears, skipped when
   Windows reports presentation mode or a full-screen app. `tools/make-sounds.py` synthesizes them,
   so they carry no license of their own.
@@ -139,6 +155,7 @@ Windows, or on Linux through the .NET Framework reference assemblies package.
 | `src/TrayApp.cs` | Tray icon and menu, pipe server, notification queue, sweep, keep-awake and lid wiring, hooks file I/O, uninstall |
 | `src/Power.cs` | Power request, lid-action override, lid switch watcher, sleep |
 | `src/SettingsWindow.cs` | The Settings window and its owner-drawn rows |
+| `src/AppPicker.cs` | The "Add an app" window and the running-process list behind it |
 | `src/Sound.cs` | Notification chimes |
 | `src/Theme.cs` | Palette, fonts, tray glyph, menu renderer |
 | `src/Updater.cs` | GitHub release check, download, checksum and version verification |
