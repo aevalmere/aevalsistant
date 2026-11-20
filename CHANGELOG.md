@@ -5,7 +5,7 @@ Each release's section here becomes its notes on the
 [semantic versioning](https://semver.org): the patch number for fixes, the minor number for new
 features, the major number for changes that need you to do something.
 
-## [Unreleased]
+## [1.4.0] - 2026-11-20
 
 ### New
 
@@ -23,11 +23,6 @@ features, the major number for changes that need you to do something.
 - More control over cards: "Notify me" (always, when needed, never), finish cards only after turns
   longer than 1, 5, or 15 minutes, reminders every few minutes while an agent still needs you, and
   no card when you are already looking at that agent's window.
-
-## [1.4.0] - 2026-10-08
-
-### New
-
 - A Settings window, opened from the tray menu. Options that only matter while another one is on
   sit under it and hide while it is off. Keep-awake now has a main switch, with "keep the screen on
   too" and "keep working with the lid closed" under it; the lid option only appears on PCs with a lid.

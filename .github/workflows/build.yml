@@ -97,10 +97,11 @@ jobs:
           path: mac/build/Aevalsistant-mac.zip
           if-no-files-found: error
 
-  # Publishes the exe and the app the build jobs tested, not rebuilds.
+  # Publishes the exe the build job tested, not a rebuild. It does not wait for the Mac job:
+  # mac-release attaches the app to the same release once the Mac build passes.
   release:
     if: github.ref_type == 'tag'
-    needs: [build, mac]
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -111,10 +112,6 @@ jobs:
         with:
           name: Aevalsistant-${{ needs.build.outputs.version }}
 
-      - uses: actions/download-artifact@v8
-        with:
-          name: Aevalsistant-mac
-
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,7 +119,6 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           sha=$(sha256sum Aevalsistant.exe | cut -d' ' -f1)
-          macsha=$(sha256sum Aevalsistant-mac.zip | cut -d' ' -f1)
           awk -v head="## [$VERSION]" '
             index($0, "## [") == 1 { if (on) exit; on = index($0, head) == 1; next }
             on { print }
@@ -135,7 +131,8 @@ jobs:
           nothing else. The exe is not code-signed yet, so Windows may say "Windows protected your
           PC" the first time. Choose **More info**, then **Run anyway**.
 
-          **Mac:** download **Aevalsistant-mac.zip** below, open it, and open Aevalsistant. It needs
+          **Mac:** download **Aevalsistant-mac.zip** below, open it, and open Aevalsistant. It is
+          added to this release a few minutes after the exe, once the Mac build passes. It needs
           macOS 13 or later, on Apple silicon or Intel. The app is not notarized yet, so macOS says it
           cannot check it the first time: open System Settings, Privacy & Security, and choose
           **Open Anyway** next to Aevalsistant.
@@ -143,6 +140,30 @@ jobs:
           Copies installed from an earlier release update themselves within six hours.
 
           - SHA-256 of Aevalsistant.exe: \`$sha\`
-          - SHA-256 of Aevalsistant-mac.zip: \`$macsha\`
           EOF
-          gh release create "$TAG" Aevalsistant.exe Aevalsistant-mac.zip --verify-tag --title "Aevalsistant $VERSION" --notes-file notes.md
+          gh release create "$TAG" Aevalsistant.exe --verify-tag --title "Aevalsistant $VERSION" --notes-file notes.md
+
+  # Adds the Mac app the mac job tested to the release, and its checksum to the notes.
+  mac-release:
+    if: github.ref_type == 'tag'
+    needs: [release, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: Aevalsistant-mac
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          macsha=$(sha256sum Aevalsistant-mac.zip | cut -d' ' -f1)
+          gh release upload "$TAG" Aevalsistant-mac.zip
+          gh release view "$TAG" --json body -q .body > notes.md
+          echo "- SHA-256 of Aevalsistant-mac.zip: \`$macsha\`" >> notes.md
+          gh release edit "$TAG" --notes-file notes.md

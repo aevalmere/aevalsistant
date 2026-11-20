@@ -2,7 +2,7 @@
   "problemMatcher": [
     {
       "owner": "swiftc",
-      "pattern": [{ "regexp": "^(.+?):(\d+):(\d+): (error): (.*)$", "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5 }]
+      "pattern": [{ "regexp": "^(.+?):(\\d+):(\\d+): (error): (.*)$", "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5 }]
     },
     {
       "owner": "mac-tests",
