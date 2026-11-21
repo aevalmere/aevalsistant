@@ -150,6 +150,7 @@ final class ToastRequest {
     // whether these show a card.
     var background = false
     var turnSeconds: Double = 0   // how long the turn that just ended ran, for "finished" cards
+    var fromAgent = false         // sent by the agent itself with --notify
 
     init(kind: ToastKind, title: String, detail: String) {
         self.kind = kind
@@ -369,6 +370,21 @@ final class SessionBook {
         return out
     }
 
+    // Busy sessions other than the one asking, which a sleep or shutdown would cut off.
+    func busyBlockers(exceptPid: Int32, exceptStart: Int64, exceptId: String?) -> [Session] {
+        all.filter { s in
+            s.busy && s.id != exceptId
+                && !(s.pid != 0 && s.pid == exceptPid && (exceptStart == 0 || s.pidStart == exceptStart))
+        }
+    }
+
+    // The session a command-line request came from: by its agent process, else by folder.
+    func find(pid: Int32, pidStart: Int64, cwd: String) -> Session? {
+        if pid != 0, let s = all.first(where: { $0.pid == pid && (pidStart == 0 || $0.pidStart == 0 || $0.pidStart == pidStart) }) { return s }
+        if cwd.isEmpty { return nil }
+        return all.first { $0.cwd == cwd }
+    }
+
     static func guessType(_ message: String) -> String {
         let m = message.lowercased()
         if m.contains("waiting for your input") { return "idle_prompt" }
@@ -515,18 +531,25 @@ final class Settings {
     var minTurn = 0                 // index into minTurnSeconds: finish cards only after longer turns
     var remind = false              // repeat "needs you" while a prompt stays open
     var remindAfter = 1             // index into remindMinutes
+    // What agents may do through the command line (--awake, --sleep, --restart, --shutdown).
+    var agentAwake = true
+    var agentSleep = true
+    var agentPower = false
+    var agentGuide = true           // keep a section about these commands in ~/.claude/CLAUDE.md
+    var agentDecides = false        // finish cards only when the agent sends one with --notify
 
     static let minTurnSeconds: [Double] = [0, 60, 300, 900]
     static let remindMinutes: [Double] = [2, 5, 10]
 
-    // The "Notify me" preset: 0 always, 1 only when agents need you, 2 never.
+    // The "Notify" preset: 0 always, 1 only when agents need you, 2 the agent decides, 3 never.
     var notifyMode: Int {
-        get { !notifyNeedsYou && !notifyDone ? 2 : !notifyDone ? 1 : 0 }
+        get { !notifyNeedsYou && !notifyDone ? 3 : (!notifyDone && agentDecides) ? 2 : !notifyDone ? 1 : 0 }
         set {
             switch newValue {
-            case 0: notifyDone = true; notifyNeedsYou = true
-            case 1: notifyDone = false; notifyNeedsYou = true
-            default: notifyDone = false; notifyNeedsYou = false
+            case 0: notifyDone = true; notifyNeedsYou = true; agentDecides = false
+            case 1: notifyDone = false; notifyNeedsYou = true; agentDecides = false
+            case 2: notifyDone = false; notifyNeedsYou = true; agentDecides = true
+            default: notifyDone = false; notifyNeedsYou = false; agentDecides = false
             }
         }
     }
@@ -566,6 +589,11 @@ final class Settings {
             case "minTurn": if let t = Int(v), (0...3).contains(t) { s.minTurn = t }
             case "remind": s.remind = b
             case "remindAfter": if let t = Int(v), (0...2).contains(t) { s.remindAfter = t }
+            case "agentAwake": s.agentAwake = b
+            case "agentSleep": s.agentSleep = b
+            case "agentPower": s.agentPower = b
+            case "agentGuide": s.agentGuide = b
+            case "agentDecides": s.agentDecides = b
             default: break
             }
         }
@@ -586,9 +614,14 @@ final class Settings {
         // A second literal, so neither one gets long enough to slow the type checker down.
         let more: [String] = [
             "watchApps=" + WatchedApp.format(watchApps), "watchAppsOn=" + b(watchAppsOn), "notifyAway=" + b(notifyAway),
-            "minTurn=" + String(minTurn), "remind=" + b(remind), "remindAfter=" + String(remindAfter), "",
+            "minTurn=" + String(minTurn), "remind=" + b(remind), "remindAfter=" + String(remindAfter),
+        ]
+        let agentLines: [String] = [
+            "agentAwake=" + b(agentAwake), "agentSleep=" + b(agentSleep), "agentPower=" + b(agentPower),
+            "agentGuide=" + b(agentGuide), "agentDecides=" + b(agentDecides), "",
         ]
         lines += more
+        lines += agentLines
         try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
     }
@@ -596,6 +629,9 @@ final class Settings {
     // Whether a card should show for this request. Background cards also need their
     // parent setting on, since Settings nests them under it.
     func wants(_ r: ToastRequest) -> Bool {
+        if r.kind == .info { return true }
+        // A card the agent chose to send shows unless notifications are off altogether.
+        if r.fromAgent { return notifyDone || notifyNeedsYou }
         switch r.kind {
         case .info: return true
         case .needsYou: return notifyNeedsYou && (!r.background || notifyBackgroundNeedsYou)
@@ -782,6 +818,257 @@ final class TimeLog {
             .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
             .map { label($0.key) + " " + Status.duration($0.value) }
             .joined(separator: ", ")
+    }
+}
+
+// A command an agent runs from its shell: `Aevalsistant --awake 2h "render"`, `--sleep`,
+// `--notify "Done" "All tests pass"`. Parsed in the short-lived command process, sent to the
+// running app as JSON, and parsed back there.
+final class AgentRequest {
+    var action = ""        // awake, release, sleep, restart, shutdown, notify, status
+    var minutes = 0        // for awake: 0 holds until released
+    var reason = ""
+    var title = ""
+    var detail = ""
+    var needsYou = false
+    var agent = "claude"
+    // Where it came from, filled in by the command process.
+    var pwd = ""
+    var host = ""
+    var appPid: Int32 = 0
+    var pid: Int32 = 0
+    var pidStart: Int64 = 0
+
+    private static let hm = try! NSRegularExpression(pattern: "^(?:(\\d+)h)?(?:(\\d+)m)?$")
+
+    // "2h", "1h30m", "30m", "45" (minutes) or "on" (0, until released). -1 when it is not one
+    // of those or falls outside a minute to a day.
+    static func parseMinutes(_ s: String) -> Int {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if t == "on" { return 0 }
+        if t.isEmpty { return -1 }
+        var total = -1
+        if t.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
+            total = t.count > 5 ? -1 : (Int(t) ?? -1)
+        } else if let m = hm.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) {
+            func group(_ i: Int) -> Int? {
+                let r = m.range(at: i)
+                guard r.location != NSNotFound, let range = Range(r, in: t) else { return nil }
+                return Int(t[range])
+            }
+            let h = group(1), mins = group(2)
+            if h == nil && mins == nil { return -1 }
+            if (h ?? 0) > 100 || (mins ?? 0) > 10000 { return -1 }
+            total = (h ?? 0) * 60 + (mins ?? 0)
+        }
+        return total >= 1 && total <= 1440 ? total : -1
+    }
+
+    // The arguments after the program name.
+    static func parse(_ args: [String]) -> AgentRequest? {
+        let r = AgentRequest()
+        var rest: [String] = []
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            if a == "--needs-you" { r.needsYou = true }
+            else if a == "--agent" {
+                guard i + 1 < args.count else { return nil }
+                r.agent = args[i + 1]
+                i += 1
+            } else { rest.append(a) }
+            i += 1
+        }
+        guard let command = rest.first else { return nil }
+        let tail = Array(rest.dropFirst())
+        switch command {
+        case "--awake":
+            guard let first = tail.first else { return nil }
+            if first.lowercased() == "off" {
+                r.action = "release"
+                return r
+            }
+            let m = parseMinutes(first)
+            if m < 0 { return nil }
+            r.action = "awake"
+            r.minutes = m
+            r.reason = tail.dropFirst().joined(separator: " ")
+        case "--sleep": r.action = "sleep"
+        case "--restart": r.action = "restart"
+        case "--shutdown": r.action = "shutdown"
+        case "--status": r.action = "status"
+        case "--notify":
+            guard let title = tail.first, !title.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+            r.action = "notify"
+            r.title = title
+            r.detail = tail.dropFirst().joined(separator: " ")
+        default: return nil
+        }
+        return r
+    }
+
+    func json() -> String {
+        "{\"cmd\":\"agent\",\"action\":" + Json.quote(action)
+            + ",\"minutes\":\(minutes)"
+            + ",\"reason\":" + Json.quote(reason)
+            + ",\"title\":" + Json.quote(title)
+            + ",\"detail\":" + Json.quote(detail)
+            + ",\"needsYou\":" + (needsYou ? "true" : "false")
+            + ",\"agent\":" + Json.quote(agent)
+            + ",\"pwd\":" + Json.quote(pwd)
+            + ",\"host\":" + Json.quote(host)
+            + ",\"app\":\(appPid)"
+            + ",\"pid\":\(pid)"
+            + ",\"pidStart\":\(pidStart)}"
+    }
+
+    static func from(_ o: JObj) -> AgentRequest? {
+        guard o.str("cmd") == "agent", let action = o.str("action"), !action.isEmpty else { return nil }
+        func num(_ k: String) -> Int64 { (o[k] as? JNum)?.int64 ?? 0 }
+        let r = AgentRequest()
+        r.action = action
+        r.minutes = Int(num("minutes"))
+        r.reason = o.str("reason") ?? ""
+        r.title = o.str("title") ?? ""
+        r.detail = o.str("detail") ?? ""
+        r.needsYou = (o["needsYou"] as? Bool) ?? false
+        let agent = o.str("agent") ?? ""
+        r.agent = agent.isEmpty ? "claude" : agent
+        r.pwd = o.str("pwd") ?? ""
+        r.host = o.str("host") ?? ""
+        r.appPid = Int32(truncatingIfNeeded: num("app"))
+        r.pid = Int32(truncatingIfNeeded: num("pid"))
+        r.pidStart = num("pidStart")
+        return r
+    }
+}
+
+// An agent asking to keep the computer awake past its own turn.
+final class Hold {
+    let key: String
+    var label: String
+    var reason: String
+    var since: Date
+    var until: Date?     // nil: until released, at most a day
+    var pid: Int32
+    var pidStart: Int64
+
+    init(key: String, label: String, reason: String, since: Date, until: Date?, pid: Int32, pidStart: Int64) {
+        self.key = key
+        self.label = label
+        self.reason = reason
+        self.since = since
+        self.until = until
+        self.pid = pid
+        self.pidStart = pidStart
+    }
+}
+
+final class AwakeHolds {
+    static let longest: TimeInterval = 24 * 3600
+
+    private(set) var all: [Hold] = []
+
+    var active: Bool { !all.isEmpty }
+
+    // One hold per agent: asking again replaces its earlier one.
+    func hold(_ h: Hold) {
+        all.removeAll { $0.key == h.key }
+        all.append(h)
+    }
+
+    @discardableResult
+    func release(_ key: String) -> Bool {
+        let before = all.count
+        all.removeAll { $0.key == key }
+        return all.count != before
+    }
+
+    // Drops holds that ran out, that have been open a day, or whose agent exited. True when any went.
+    func sweep(_ now: Date, alive: (Hold) -> Bool) -> Bool {
+        let before = all.count
+        all.removeAll { h in
+            if let u = h.until { if u <= now { return true } }
+            else if now.timeIntervalSince(h.since) >= AwakeHolds.longest { return true }
+            return h.pid != 0 && !alive(h)
+        }
+        return all.count != before
+    }
+
+    // "1h 20m left", "until released"
+    static func text(_ h: Hold, _ now: Date) -> String {
+        guard let u = h.until else { return "until released" }
+        return Status.duration(max(0, u.timeIntervalSince(now))) + " left"
+    }
+}
+
+// The section the app keeps in ~/.claude/CLAUDE.md so Claude Code knows these commands. It sits
+// between two markers and follows the Settings; everything else in the file is left alone.
+enum AgentGuide {
+    static let start = "<!-- aevalsistant:start -->"
+    static let end = "<!-- aevalsistant:end -->"
+
+    static func block(_ c: String, _ s: Settings) -> String {
+        guard s.agentGuide else { return "" }
+        var lines: [String] = [
+            start,
+            "## Aevalsistant",
+            "",
+            "Aevalsistant is the user's tray app that keeps this computer awake while agents work and shows notification cards. You can run these commands from the shell; each prints what happened.",
+            "",
+            "- `" + c + " --notify \"<title>\" \"<detail>\"` shows a card. Add `--needs-you` when you are blocked until the user answers.",
+        ]
+        if s.agentAwake {
+            lines.append("- `" + c + " --awake 2h \"<reason>\"` keeps the computer awake after your turn ends, for work that keeps running such as a render, a build, or a download. Use a duration like 30m, 2h or 1h30m, or `on` to hold until `" + c + " --awake off`. Release it when that work is done.")
+        }
+        if s.agentSleep {
+            lines.append("- `" + c + " --sleep` puts the computer to sleep. Only when the user asks for it.")
+        }
+        if s.agentPower {
+            lines.append("- `" + c + " --restart` and `" + c + " --shutdown` restart or shut down the computer. Only when the user asks for it.")
+        }
+        if s.agentSleep || s.agentPower {
+            lines.append("- The app refuses these while another agent or a watched app is busy, and gives the user time to cancel.")
+        }
+        lines.append("")
+        if s.agentDecides && !s.notifyDone {
+            lines.append("The user lets you decide when to notify them: automatic cards for finished turns are off. Run `--notify` when you finish something the user should look at, or when you are blocked on them, and not for quick back-and-forth replies.")
+        } else {
+            lines.append("Cards for finished turns and permission prompts are automatic, so use `--notify` only when the user asks for one or for work that finishes after your turn.")
+        }
+        lines.append(end)
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    // The file's new text with our section replaced by `block`, or removed when it is empty.
+    // nil when there was no file and nothing to write.
+    static func apply(_ text: String?, _ block: String) -> String? {
+        // By unicode scalar, since Swift counts "\r\n" as one character.
+        func trimEnd(_ s: String) -> String {
+            var u = s.unicodeScalars
+            while let l = u.last, l == "\n" || l == "\r" { u.removeLast() }
+            return String(u)
+        }
+        func trimStart(_ s: String) -> String {
+            var u = s.unicodeScalars
+            while let f = u.first, f == "\n" || f == "\r" { u.removeFirst() }
+            return String(u)
+        }
+        let t = text ?? ""
+        var rest: String
+        if let s = t.range(of: start), let e = t.range(of: end, range: s.upperBound..<t.endIndex) {
+            let before = trimEnd(String(t[..<s.lowerBound]))
+            let after = trimStart(String(t[e.upperBound...]))
+            rest = before.isEmpty ? after : (after.isEmpty ? before : before + "\n\n" + after)
+        } else {
+            rest = t
+        }
+        rest = trimEnd(rest)
+        if block.isEmpty {
+            if text == nil { return nil }
+            return rest.isEmpty ? "" : rest + "\n"
+        }
+        return rest.isEmpty ? block : rest + "\n\n" + block
     }
 }
 

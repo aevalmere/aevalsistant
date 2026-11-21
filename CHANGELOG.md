@@ -5,6 +5,24 @@ Each release's section here becomes its notes on the
 [semantic versioning](https://semver.org): the patch number for fixes, the minor number for new
 features, the major number for changes that need you to do something.
 
+## [1.5.0] - 2026-11-21
+
+### New
+
+- Agents can control the computer from their shell: `--awake 2h "render"` keeps it awake after
+  the agent's turn ends (until the time runs out, `--awake off`, or the agent exits), `--sleep`,
+  `--restart` and `--shutdown` turn it off when you ask them to, and `--notify` shows a card. Sleep,
+  restart and shutdown are refused while another agent or a watched app is busy, and come with a
+  countdown card you can click to cancel. Each command prints what happened.
+- "Agent decides", a new choice under Notify: cards for finished turns are off and the agent sends
+  a card itself when there is something to look at. Permission prompts still show.
+- An "Agent control" section in Settings switches each of these on or off. Restart and shutdown
+  start off.
+- "Teach Claude Code these commands" keeps a short section in `~/.claude/CLAUDE.md` that explains
+  the commands and follows your settings. The file is backed up once before the first change, and
+  the section is removed when you turn this off or remove the app.
+- Holds show in the menu with their time left; click one to release it.
+
 ## [1.4.0] - 2026-11-20
 
 ### New

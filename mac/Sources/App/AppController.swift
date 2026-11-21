@@ -42,6 +42,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var quitting = false
     private let timeLog = TimeLog.load(AppPaths.time)
     private var appsOpen: [String: Date] = [:]   // watched app name -> when it was first seen open
+    // Agents asking to keep the Mac awake past their turn (--awake), and a sleep, restart or
+    // shutdown counting down (--sleep, --restart, --shutdown).
+    private let holds = AwakeHolds()
+    private var power: PowerPlan?
+    private let appCommand = Agents.hookPath(Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/Aevalsistant").path)
+
+    private final class PowerPlan {
+        let kind: String           // sleep, restart, shutdown
+        let seconds: Double
+        let card: ToastRequest
+        let request: AgentRequest
+        let sessionId: String?
+        var timer: Timer?
+
+        init(kind: String, seconds: Double, card: ToastRequest, request: AgentRequest, sessionId: String?) {
+            self.kind = kind
+            self.seconds = seconds
+            self.card = card
+            self.request = request
+            self.sessionId = sessionId
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         toast.expandOnHover = settings.expandOnHover
@@ -59,6 +81,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settings.hooks { syncAgents(true) }
         if settings.chats { startChats() }
         setStartup(settings.startup)
+        syncGuide()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         menu.delegate = self
@@ -123,6 +146,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if text.hasPrefix("{\"cmd\":\"quit\"") { quit(); return nil }
         if text.hasPrefix("{\"cmd\":\"status\"") { return statusJson() }
+        if text.hasPrefix("{\"cmd\":\"agent\""), let o = Json.tryParse(text) as? JObj, let req = AgentRequest.from(o) {
+            return handleAgent(req)
+        }
         if let e = HookEvent.fromEnvelope(text) { ingest(e) }
         return nil
     }
@@ -147,6 +173,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ("version", Updater.currentText), ("busy", JNum(book.busyCount)), ("sessions", sessions),
             ("card", toast.showing ? toast.title : ""), ("keepAwake", awake.systemOn), ("screenOn", awake.displayOn),
             ("lidOverride", !settings.lidSaved.isEmpty), ("agents", agents), ("apps", JArr(appsOpen.keys.sorted() as [Any])),
+            ("holds", JArr(holds.all.map { $0.label } as [Any])),
             ("problems", JArr((Array(agentProblems.values) + [socketProblem, lidProblem, chatProblem, startupProblem].compactMap { $0 }) as [Any])))
         return Json.write(root) + "\n"
     }
@@ -223,7 +250,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         c.rows = tree.prefix(ToastArt.maxRows).map { rowFor($0, now) }
         if tree.count > ToastArt.maxRows { c.overflow = "\(tree.count - ToastArt.maxRows) more in the menu" }
         shown = c
-        toast.show(c, seconds: restart ? settings.seconds(top.kind) : -1)
+        // A sleep or shutdown countdown card stays up for the whole countdown.
+        let seconds = power.map { $0.card === top ? $0.seconds : settings.seconds(top.kind) } ?? settings.seconds(top.kind)
+        toast.show(c, seconds: restart ? seconds : -1)
     }
 
     // A subagent row focuses its session's app, since that is where it runs.
@@ -245,6 +274,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Click on the main row or Option-Tab: that session. Click on a listed row: that one.
     private func activate(_ target: Int) {
+        // Clicking a sleep or shutdown countdown card cancels it.
+        if let p = power, let top = pending.last(where: { !$0.wantsSnippet }), top === p.card {
+            cancelPower()
+            return
+        }
         var sid: String?
         var pid: Int32 = 0
         if target >= 0, let c = shown, target < c.rows.count {
@@ -289,7 +323,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let before = pending.count
         pending.removeAll { $0.sessionId != nil && book.get($0.sessionId) == nil }
         if pending.count != before { if pending.isEmpty { toast.hide() } else if toast.showing { showTop() } }
-        if changed { refreshState(); if toast.showing { showTop(restart: false) } } else if appsChanged { refreshState() }
+        let holdsChanged = holds.sweep(now, alive: { $0.pid == 0 || Terminals.isAlive($0.pid, $0.pidStart) })
+        if changed { refreshState(); if toast.showing { showTop(restart: false) } } else if appsChanged || holdsChanged { refreshState() }
         if settings.remind {
             for r in book.reminders(now, every: Settings.remindMinutes[settings.remindAfter] * 60) { enqueue(r) }
         }
@@ -326,6 +361,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if working > 0 { parts.append("\(Plural.agents(working)) working") }
         let open = settings.watchApps.filter { appsOpen[$0.name] != nil }.map { $0.label }
         if !open.isEmpty { parts.append(open.joined(separator: ", ") + " open") }
+        for h in holds.all { parts.append(h.label + " holding" + (h.reason.isEmpty ? "" : " (" + h.reason + ")")) }
         return parts.joined(separator: ", ")
     }
 
@@ -386,7 +422,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshState() {
         tryApplyUpdate()
-        let on = book.busyCount > 0 || !appsOpen.isEmpty
+        let on = book.busyCount > 0 || !appsOpen.isEmpty || holds.active
         let keep = on && settings.keepAwake
         awake.set(system: keep, display: keep && settings.displayOn)
 
@@ -429,7 +465,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func sleepIfLidStillShut() {
         lidSleep = nil
-        if book.busyCount > 0 || !appsOpen.isEmpty || !Lid.closed { return }
+        if book.busyCount > 0 || !appsOpen.isEmpty || holds.active || !Lid.closed { return }
         Lid.sleepNow()
     }
 
@@ -499,6 +535,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.image = Theme.dot(16, Theme.slate, hollow: true)
             menu.addItem(item)
         }
+        // Agents holding the Mac awake past their turn; clicking one lets go of it.
+        for h in holds.all {
+            let text = h.label + " keeps awake" + (h.reason.isEmpty ? "" : "  ·  " + h.reason)
+            let item = NSMenuItem(title: text, action: #selector(menuRelease(_:)), keyEquivalent: "")
+            item.target = self
+            item.attributedTitle = sessionTitle(text, AwakeHolds.text(h, now))
+            item.image = Theme.dot(16, Theme.slate, hollow: true)
+            item.toolTip = "Click to stop keeping the Mac awake for this"
+            item.representedObject = h.key
+            menu.addItem(item)
+        }
+        if let p = power {
+            let c = NSMenuItem(title: "Cancel " + p.kind, action: #selector(menuCancelPower), keyEquivalent: "")
+            c.target = self
+            menu.addItem(c)
+        }
         let today = timeLog.summary(timeLog.today) { timeLabel($0) }
         if !today.isEmpty { menu.addItem(label("Today: " + today)) }
         menu.addItem(.separator())
@@ -540,6 +592,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func menuQuit() { quit() }
+
+    @objc private func menuRelease(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        if holds.release(key) { refreshState() }
+    }
+
+    @objc private func menuCancelPower() { cancelPower() }
 
     // Shown even with finish cards turned off, since asking for it is the point. The long
     // message shows off the hover expansion.
@@ -605,14 +664,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         w.addButton("Add an app…", under: watch) { [self] in openPicker() }
 
         w.section("Notifications")
-        notifyChoice = w.addChoice("Notify me", ["Always", "When needed", "Never"], settings.notifyMode) { [self] i in
+        notifyChoice = w.addChoice("Notify", ["Always", "If needed", "Agent decides", "Never"], settings.notifyMode) { [self] i in
             settings.notifyMode = i
             save()
             doneToggle?.on = settings.notifyDone
             asksToggle?.on = settings.notifyNeedsYou
+            syncGuide()
         }
         let done = w.addToggle("Show a card when an agent finishes", nil, settings.notifyDone) { [self] v in
-            settings.notifyDone = v; save(); notifyChoice?.selected = settings.notifyMode
+            settings.notifyDone = v
+            save()
+            notifyChoice?.selected = settings.notifyMode
+            syncGuide()
         }
         doneToggle = done
         w.addToggle("Also when background agents finish", "Subagents, and agents that another agent started.",
@@ -621,7 +684,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings.minTurn = i; save()
         }
         let asks = w.addToggle("Show a card when an agent needs you", nil, settings.notifyNeedsYou) { [self] v in
-            settings.notifyNeedsYou = v; save(); notifyChoice?.selected = settings.notifyMode
+            settings.notifyNeedsYou = v
+            save()
+            notifyChoice?.selected = settings.notifyMode
+            syncGuide()
         }
         asksToggle = asks
         w.addToggle("Also when a background agent needs you", nil, settings.notifyBackgroundNeedsYou, under: asks) { [self] v in
@@ -678,6 +744,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Adds the app to the list (switched off) and opens the pane, so it is one click.
             _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
             if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(u) }
+        }
+
+        w.section("Agent control")
+        w.addToggle("Let agents keep the Mac awake", "`--awake 2h` keeps the Mac awake after the agent's turn ends.", settings.agentAwake) { [self] v in
+            settings.agentAwake = v
+            if !v { for h in holds.all { holds.release(h.key) }; refreshState() }
+            save()
+            syncGuide()
+        }
+        w.addToggle("Let agents put the Mac to sleep", nil, settings.agentSleep) { [self] v in
+            settings.agentSleep = v; save(); syncGuide()
+        }
+        w.addToggle("Let agents restart or shut down the Mac", "The app refuses while anything is busy and gives you 60 seconds to cancel.",
+                    settings.agentPower) { [self] v in
+            settings.agentPower = v; save(); syncGuide()
+        }
+        w.addToggle("Teach Claude Code these commands", "Adds a short section to ~/.claude/CLAUDE.md that follows these settings.",
+                    settings.agentGuide) { [self] v in
+            settings.agentGuide = v; save(); syncGuide()
         }
 
         w.section("Time")
@@ -811,6 +896,142 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimeNotes()
     }
 
+    // ---- agent commands ---------------------------------------------------------------
+
+    // `Aevalsistant --awake 2h "render"`, `--sleep`, `--notify "Done"`... run by an agent from
+    // its shell. The reply is printed in that shell, so it says plainly what happened.
+    private func handleAgent(_ req: AgentRequest) -> String {
+        let session = book.find(pid: req.pid, pidStart: req.pidStart, cwd: req.pwd)
+        let key = req.pid != 0 ? "pid:\(req.pid):\(req.pidStart)" : "cwd:" + req.pwd
+        let folder = (req.pwd as NSString).lastPathComponent
+        let label = session?.project ?? (folder.isEmpty || folder == "/" ? "An agent" : folder)
+        let now = Date()
+
+        switch req.action {
+        case "awake":
+            guard settings.agentAwake else { return "Refused: agents may not keep this computer awake (Aevalsistant settings).\n" }
+            holds.hold(Hold(key: key, label: label, reason: req.reason, since: now,
+                            until: req.minutes == 0 ? nil : now.addingTimeInterval(Double(req.minutes) * 60),
+                            pid: req.pid, pidStart: req.pidStart))
+            refreshState()
+            if req.minutes == 0 { return "Keeping the computer awake until you run --awake off.\n" }
+            return "Keeping the computer awake for " + Status.duration(Double(req.minutes) * 60)
+                + (req.reason.isEmpty ? "" : " (" + req.reason + ")") + ".\n"
+
+        case "release":
+            let released = holds.release(key)
+            if released { refreshState() }
+            return released ? "Released.\n" : "Nothing to release.\n"
+
+        case "sleep", "restart", "shutdown":
+            let verb = powerVerb(req.action)
+            let allowed = req.action == "sleep" ? settings.agentSleep : settings.agentPower
+            guard allowed else { return "Refused: agents may not \(verb) this computer (Aevalsistant settings).\n" }
+            if let p = power { return "Refused: a \(p.kind) is already pending.\n" }
+            if holds.release(key) { refreshState() }
+            let busy = powerBlockers(req, sessionId: session?.id)
+            if !busy.isEmpty { return "Refused: still busy: " + busy.joined(separator: ", ") + ".\n" }
+            let seconds: Double = req.action == "sleep" ? 15 : 60
+            let title = req.action == "sleep" ? "Going to sleep in 15 seconds"
+                : req.action == "restart" ? "Restarting in 60 seconds" : "Shutting down in 60 seconds"
+            let card = ToastRequest(kind: .info, title: title, detail: "\(label) asked for it. Click this card to cancel.")
+            let plan = PowerPlan(kind: req.action, seconds: seconds, card: card, request: req, sessionId: session?.id)
+            let t = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in self?.firePower() }
+            RunLoop.main.add(t, forMode: .common)
+            plan.timer = t
+            power = plan
+            pending.append(card)
+            if settings.sound { Sound.play(card.kind) }
+            showTop()
+            return title + " unless the user cancels.\n"
+
+        case "notify":
+            let r = ToastRequest(kind: req.needsYou ? .needsYou : .done, title: req.title, detail: req.detail)
+            r.sessionId = session?.id
+            r.appPid = session?.appPid ?? req.appPid
+            r.host = session?.whereLabel ?? req.host
+            r.fromAgent = true
+            if !settings.wants(r) { return "Not shown: notifications are off (Aevalsistant settings).\n" }
+            if lookingAt(r) { return "Not shown: the user is already looking at it.\n" }
+            enqueue(r)
+            return "Shown.\n"
+
+        case "status":
+            let reason = awakeReason()
+            let modes = ["always", "if needed", "agent decides", "never"]
+            return "Aevalsistant \(Updater.currentText): " + (reason.isEmpty ? "idle" : reason)
+                + (settings.keepAwake ? "" : ", keep-awake off") + ". Notify: " + modes[settings.notifyMode]
+                + (power.map { ". A " + $0.kind + " is pending" } ?? "") + ".\n"
+
+        default:
+            return "Refused: unknown command.\n"
+        }
+    }
+
+    private func powerVerb(_ kind: String) -> String {
+        kind == "sleep" ? "put to sleep" : kind == "restart" ? "restart" : "shut down"
+    }
+
+    // What a sleep or shutdown would cut off, other than the agent asking for it.
+    private func powerBlockers(_ req: AgentRequest, sessionId: String?) -> [String] {
+        var names = book.busyBlockers(exceptPid: req.pid, exceptStart: req.pidStart, exceptId: sessionId).map { $0.project }
+        names += settings.watchApps.filter { appsOpen[$0.name] != nil }.map { $0.label }
+        names += holds.all.map { $0.label }
+        return names
+    }
+
+    private func firePower() {
+        guard let p = power else { return }
+        power = nil
+        pending.removeAll { $0 === p.card }
+        if pending.isEmpty { toast.hide() } else if toast.showing { showTop(restart: false) }
+        let busy = powerBlockers(p.request, sessionId: p.sessionId)
+        if !busy.isEmpty {
+            enqueue(ToastRequest(kind: .info, title: "Did not \(powerVerb(p.kind))",
+                                 detail: busy.joined(separator: ", ") + " became busy."))
+            return
+        }
+        switch p.kind {
+        case "sleep":
+            Lid.sleepNow()
+        default:
+            let script = p.kind == "restart" ? "tell application \"System Events\" to restart" : "tell application \"System Events\" to shut down"
+            if FileManager.default.fileExists(atPath: AppPaths.home) { timeLog.save(AppPaths.time) }
+            DispatchQueue.global(qos: .userInitiated).async { _ = Lid.run("/usr/bin/osascript", ["-e", script]) }
+        }
+    }
+
+    private func cancelPower() {
+        guard let p = power else { return }
+        p.timer?.invalidate()
+        power = nil
+        pending.removeAll { $0 === p.card }
+        if pending.isEmpty { toast.hide() }
+        enqueue(ToastRequest(kind: .info, title: "Cancelled", detail: "The \(p.kind) was cancelled."))
+    }
+
+    // Keeps the Aevalsistant section of ~/.claude/CLAUDE.md in line with Settings. The file is
+    // backed up once before the first change, and nothing outside the section is touched.
+    private func syncGuide(removing: Bool = false) {
+        let fm = FileManager.default
+        let dir = AppPaths.userHome + "/.claude"
+        let path = dir + "/CLAUDE.md"
+        let text = try? String(contentsOfFile: path, encoding: .utf8)
+        if fm.fileExists(atPath: path) && text == nil { return }   // unreadable: leave it alone
+        let block = removing ? "" : AgentGuide.block(appCommand, settings)
+        guard let next = AgentGuide.apply(text, block), next != text else { return }
+        do {
+            try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let backup = path + ".aevalsistant.bak"
+            if let text = text, !fm.fileExists(atPath: backup) { try text.write(toFile: backup, atomically: true, encoding: .utf8) }
+            try writeConfig(path, next)
+        } catch {
+            agentProblems["guide"] = "Could not update ~/.claude/CLAUDE.md (\(error.localizedDescription))"
+            return
+        }
+        agentProblems.removeValue(forKey: "guide")
+    }
+
     // ---- install surface ----------------------------------------------------------
 
     private func agentFile(_ a: AgentSpec) -> String { AppPaths.userHome + "/" + a.file }
@@ -893,6 +1114,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard a.runModal() == .alertSecondButtonReturn else { return }
         syncAgents(false)
+        syncGuide(removing: true)
         setStartup(false)
         if !settings.lidSaved.isEmpty, Lid.setSleepDisabled(false) == nil { settings.lidSaved = "" }
         _ = Lid.revoke()
@@ -911,6 +1133,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sweepTimer?.invalidate()
         updateTimer?.invalidate()
         lidSleep?.invalidate()
+        power?.timer?.invalidate()
+        power = nil
         if FileManager.default.fileExists(atPath: AppPaths.home) { timeLog.save(AppPaths.time) }
         if !settings.lidSaved.isEmpty, Lid.setSleepDisabled(false) == nil {
             settings.lidSaved = ""

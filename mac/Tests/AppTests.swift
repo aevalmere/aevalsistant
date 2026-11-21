@@ -74,7 +74,7 @@ enum AppTests {
         check(w.pageHeight < withKrita, "settings: a removed toggle leaves the page")
 
         w.section("Notifications")
-        w.addChoice("Notify me", ["Always", "When needed", "Never"], 0) { _ in }
+        w.addChoice("Notify", ["Always", "If needed", "Agent decides", "Never"], 2) { _ in }
         let finish = w.addToggle("Show a card when an agent finishes", nil, true) { _ in }
         w.addToggle("Also when background agents finish", "Subagents, and agents that another agent started.", false, under: finish) { _ in }
         w.addChoice("Only after turns longer than", ["Any", "1 min", "5 min", "15 min"], 1, under: finish) { _ in }
@@ -99,6 +99,12 @@ enum AppTests {
         let chats = w.addToggle("Watch Claude and ChatGPT desktop chats", "Notices a reply finishing while you are in another app.", true) { _ in }
         w.addNote("Needs Accessibility access: allow Aevalsistant in System Settings, Privacy & Security, Accessibility.", under: chats)
         w.addButton("Open Accessibility settings", under: chats) {}
+
+        w.section("Agent control")
+        w.addToggle("Let agents keep the Mac awake", "`--awake 2h` keeps the Mac awake after the agent's turn ends.", true) { _ in }
+        w.addToggle("Let agents put the Mac to sleep", nil, true) { _ in }
+        w.addToggle("Let agents restart or shut down the Mac", "The app refuses while anything is busy and gives you 60 seconds to cancel.", false) { _ in }
+        w.addToggle("Teach Claude Code these commands", "Adds a short section to ~/.claude/CLAUDE.md that follows these settings.", true) { _ in }
 
         w.section("Time")
         w.addNote("Today: Claude Code 2h 5m, Blender 1h 2m, Codex 12m\nAll time: Claude Code 41h 3m, Blender 18h 40m, Codex 3h 2m")

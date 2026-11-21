@@ -28,7 +28,7 @@ namespace Aevalsistant
                 Check(obs.Shown && !gone.Shown, "settings: app rows can be added and removed while the window is open");
 
                 w.Section("Notifications");
-                w.AddChoice("Notify me", new[] { "Always", "When needed", "Never" }, 0, i => { });
+                w.AddChoice("Notify", new[] { "Always", "If needed", "Agent decides", "Never" }, 0, i => { });
                 var finish = w.AddToggle("Show a card when an agent finishes", null, true, v => { });
                 w.AddToggle("Also when background agents finish", null, false, v => { }, finish);
                 w.AddChoice("Only after turns longer than", new[] { "Any", "1 min", "5 min", "15 min" }, 1, i => { }, finish);
@@ -51,6 +51,12 @@ namespace Aevalsistant
                 var cursor = w.AddToggle("Cursor", "Not connected", false, v => { }, agents);
                 w.AddToggle("List subagents under their session", null, true, v => { });
                 w.AddToggle("Watch Claude and ChatGPT desktop chats", null, true, v => { });
+
+                w.Section("Agent control");
+                w.AddToggle("Let agents keep the PC awake", "An agent can run --awake 2h to hold the PC awake after its turn ends.", true, v => { });
+                w.AddToggle("Let agents put the PC to sleep", null, true, v => { });
+                w.AddToggle("Let agents restart or shut down the PC", "Refused while anything is busy, and you get 60 seconds to cancel.", false, v => { });
+                w.AddToggle("Teach Claude Code these commands", "Adds a short section to ~/.claude/CLAUDE.md that follows these settings.", true, v => { });
 
                 w.Section("Time");
                 w.AddNote("Today: Blender 3h 10m, Claude Code 2h 5m\nAll time: Claude Code 41h 2m, Blender 12h 40m");

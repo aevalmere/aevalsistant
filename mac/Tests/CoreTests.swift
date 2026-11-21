@@ -40,6 +40,9 @@ enum CoreTests {
         watchedApps()
         timeLog()
         notifyOptions()
+        agentCommands()
+        awakeHolds()
+        agentGuide()
     }
 
     static func jsonRoundTrip() {
@@ -516,7 +519,27 @@ enum CoreTests {
         s.notifyMode = 1
         check(!s.notifyDone && s.notifyNeedsYou && s.notifyMode == 1, "notify: needs-me-only turns off finish cards")
         s.notifyMode = 2
-        check(!s.notifyDone && !s.notifyNeedsYou && s.notifyMode == 2, "notify: never turns off both")
+        check(!s.notifyDone && s.notifyNeedsYou && s.agentDecides && s.notifyMode == 2, "notify: agent decides keeps needs-you cards and turns off finish cards")
+        s.notifyMode = 3
+        check(!s.notifyDone && !s.notifyNeedsYou && !s.agentDecides && s.notifyMode == 3, "notify: never turns off both")
+        s.notifyMode = 1
+        check(!s.agentDecides && s.notifyMode == 1, "notify: leaving agent decides clears it")
+        s.notifyMode = 2
+        s.notifyDone = true
+        check(s.notifyMode == 0, "notify: turning finish cards back on reads as always")
+        s.notifyMode = 0
+        check(!s.agentDecides, "notify: always clears agent decides")
+
+        let agentCard = ToastRequest(kind: .done, title: "Render done", detail: "")
+        agentCard.fromAgent = true
+        agentCard.turnSeconds = 5
+        s.notifyMode = 2
+        let autoDone = ToastRequest(kind: .done, title: "", detail: "")
+        check(s.wants(agentCard) && !s.wants(autoDone), "notify: agent decides shows the agent's own cards, not automatic finish cards")
+        s.notifyMode = 1
+        check(s.wants(agentCard), "notify: an agent's card shows while needs-you cards are on")
+        s.notifyMode = 3
+        check(!s.wants(agentCard), "notify: never hides the agent's cards too")
         s.notifyMode = 0
 
         s.minTurn = 1
@@ -568,6 +591,136 @@ enum CoreTests {
         check(Release.parseTag("v1.2.0") == [1, 2, 0] && Release.parseTag("1.10") == [1, 10, 0] && Release.parseTag("nightly") == nil
               && Release.newer([1, 10, 0], than: [1, 9, 9]) && !Release.newer([1, 4, 0], than: [1, 4, 0]) && !Release.newer([1, 3, 0], than: [1, 4, 0]),
               "update: release tags compare against the build version")
+    }
+
+    // `Aevalsistant --awake 2h "render"` and friends, as the command process parses them.
+    static func agentCommands() {
+        let good: [(String, Int)] = [("30m", 30), ("2h", 120), ("1h30m", 90), ("45", 45), (" 2H ", 120), ("on", 0)]
+        check(good.allSatisfy { AgentRequest.parseMinutes($0.0) == $0.1 }, "agent: durations parse")
+        let bad = ["", "0", "25h", "1441", "2x", "h", "999999", "-5", "1d"]
+        check(bad.allSatisfy { AgentRequest.parseMinutes($0) == -1 } && AgentRequest.parseMinutes("24h") == 1440,
+              "agent: bad or out-of-range durations rejected")
+
+        let a = AgentRequest.parse(["--awake", "2h", "rendering", "shot", "4"])
+        check(a?.action == "awake" && a?.minutes == 120 && a?.reason == "rendering shot 4", "agent: --awake with a duration and reason")
+        check(AgentRequest.parse(["--awake", "on"]).map { $0.action == "awake" && $0.minutes == 0 } == true, "agent: --awake on holds until released")
+        check(AgentRequest.parse(["--awake", "OFF"])?.action == "release", "agent: --awake off releases")
+        check(AgentRequest.parse(["--awake"]) == nil && AgentRequest.parse(["--awake", "soon"]) == nil, "agent: --awake needs a valid duration")
+        check(["sleep", "restart", "shutdown", "status"].allSatisfy { AgentRequest.parse(["--" + $0])?.action == $0 },
+              "agent: power and status commands")
+        let n = AgentRequest.parse(["--notify", "Build done", "All", "tests", "pass", "--needs-you", "--agent", "codex"])
+        check(n.map { [$0.action, $0.title, $0.detail, $0.agent] == ["notify", "Build done", "All tests pass", "codex"] && $0.needsYou } == true,
+              "agent: --notify with detail, --needs-you, and --agent anywhere")
+        check(AgentRequest.parse(["--notify"]) == nil && AgentRequest.parse(["--notify", "  "]) == nil, "agent: --notify needs a title")
+        check(AgentRequest.parse([]) == nil && AgentRequest.parse(["--bogus"]) == nil && AgentRequest.parse(["--sleep", "--agent"]) == nil,
+              "agent: unknown or incomplete commands rejected")
+
+        let r = AgentRequest.parse(["--notify", "Say \"hi\"", "line\nnext", "--needs-you"])!
+        r.pwd = "/Users/andy/code/aevalrena"
+        r.host = "Terminal"
+        r.appPid = 42
+        r.pid = 7
+        r.pidStart = 99
+        if let back = AgentRequest.from(parseObj(r.json())) {
+            let texts = [back.action, back.title, back.detail, back.agent, back.pwd, back.host]
+            check(texts == ["notify", "Say \"hi\"", "line\nnext", "claude", r.pwd, "Terminal"] && back.needsYou,
+                  "agent: a request's text survives the trip to the app")
+            check(back.appPid == 42 && back.pid == 7 && back.pidStart == 99, "agent: a request's process ids survive the trip")
+        } else {
+            check(false, "agent: a request survives the trip to the app")
+        }
+        let w = AgentRequest.parse(["--awake", "1h30m", "x"])!
+        check(AgentRequest.from(parseObj(w.json())).map { $0.minutes == 90 && $0.reason == "x" && !$0.needsYou } == true, "agent: minutes survive the trip")
+        check(AgentRequest.from(parseObj("{\"cmd\":\"status\"}")) == nil && AgentRequest.from(parseObj("{\"cmd\":\"agent\",\"action\":\"\"}")) == nil,
+              "agent: other messages are not agent requests")
+        check(r.json().hasPrefix("{\"cmd\":\"agent\""), "agent: the app recognises the message by its prefix")
+
+        // A sleep or shutdown waits for every other busy session, but not the one asking.
+        let t0 = Date(timeIntervalSince1970: 1_791_374_400)
+        let book = SessionBook()
+        _ = book.apply(ev("UserPromptSubmit", "s1", at: 1), t0)
+        let other = ev("UserPromptSubmit", "s2", at: 2)
+        other.cwd = "/Users/andy/code/other"
+        other.pid = 8
+        other.pidStart = 100
+        _ = book.apply(other, t0)
+        check(book.busyBlockers(exceptPid: 7, exceptStart: 99, exceptId: "s1").map { $0.id } == ["s2"], "agent: the requester is not its own blocker")
+        check(book.busyBlockers(exceptPid: 7, exceptStart: 0, exceptId: nil).map { $0.id } == ["s2"], "agent: matched by pid alone when the start time is unknown")
+        check(book.busyBlockers(exceptPid: 0, exceptStart: 0, exceptId: nil).count == 2, "agent: an unknown requester is blocked by every busy session")
+        _ = book.apply(ev("Stop", "s2", at: 3), t0)
+        check(book.busyBlockers(exceptPid: 7, exceptStart: 99, exceptId: "s1").isEmpty, "agent: idle sessions do not block")
+
+        check(book.find(pid: 8, pidStart: 100, cwd: "")?.id == "s2", "agent: the requester found by its process")
+        check(book.find(pid: 0, pidStart: 0, cwd: "/Users/andy/code/aevalrena")?.id == "s1", "agent: the requester found by its folder")
+        check(book.find(pid: 8, pidStart: 1, cwd: "/nowhere") == nil && book.find(pid: 0, pidStart: 0, cwd: "") == nil, "agent: no match, no session")
+    }
+
+    static func awakeHolds() {
+        let t0 = Date(timeIntervalSince1970: 1_791_374_400)
+        let holds = AwakeHolds()
+        check(!holds.active, "hold: none at start")
+        holds.hold(Hold(key: "pid:7:99", label: "aevalrena", reason: "render", since: t0, until: t0.addingTimeInterval(3600), pid: 7, pidStart: 99))
+        check(holds.active && AwakeHolds.text(holds.all[0], t0.addingTimeInterval(600)) == "50m left", "hold: a timed hold counts down")
+        holds.hold(Hold(key: "pid:7:99", label: "aevalrena", reason: "longer", since: t0, until: t0.addingTimeInterval(7200), pid: 7, pidStart: 99))
+        check(holds.all.count == 1 && holds.all[0].reason == "longer", "hold: asking again replaces the agent's hold")
+        holds.hold(Hold(key: "cwd:/tmp/x", label: "x", reason: "", since: t0, until: nil, pid: 0, pidStart: 0))
+        check(holds.all.count == 2 && AwakeHolds.text(holds.all[1], t0) == "until released", "hold: an open hold")
+
+        check(!holds.sweep(t0.addingTimeInterval(60), alive: { _ in true }), "hold: nothing expires early")
+        check(holds.sweep(t0.addingTimeInterval(60), alive: { _ in false }) && holds.all.map { $0.key } == ["cwd:/tmp/x"],
+              "hold: a hold goes when its agent exits; one without a process stays")
+        holds.hold(Hold(key: "pid:9:1", label: "y", reason: "", since: t0, until: t0.addingTimeInterval(120), pid: 9, pidStart: 1))
+        check(holds.sweep(t0.addingTimeInterval(120), alive: { _ in true }) && holds.all.count == 1, "hold: a timed hold ends on time")
+        check(!holds.sweep(t0.addingTimeInterval(23 * 3600), alive: { _ in true }) && holds.sweep(t0.addingTimeInterval(24 * 3600), alive: { _ in true }) && !holds.active,
+              "hold: an open hold lasts at most a day")
+
+        holds.hold(Hold(key: "a", label: "a", reason: "", since: t0, until: nil, pid: 0, pidStart: 0))
+        check(holds.release("a") && !holds.release("a") && !holds.active, "hold: release reports whether there was one")
+    }
+
+    // The section kept in ~/.claude/CLAUDE.md.
+    static func agentGuide() {
+        let c = "'/Applications/Aevalsistant.app/Contents/MacOS/Aevalsistant'"
+        let s = Settings()
+        let block = AgentGuide.block(c, s)
+        check(block.hasPrefix(AgentGuide.start + "\n") && block.hasSuffix(AgentGuide.end + "\n"), "guide: the block sits between its markers")
+        check(block.contains(c + " --notify") && block.contains(c + " --awake 2h") && block.contains(c + " --sleep") && !block.contains("--restart"),
+              "guide: lists the commands the settings allow")
+        check(block.contains("are automatic"), "guide: says finish cards are automatic by default")
+        s.agentPower = true
+        s.agentAwake = false
+        s.notifyMode = 2
+        let other = AgentGuide.block(c, s)
+        check(other.contains("--restart") && other.contains("--shutdown") && !other.contains("--awake 2h") && other.contains("lets you decide"),
+              "guide: follows the settings, including agent decides")
+        s.agentGuide = false
+        check(AgentGuide.block(c, s).isEmpty, "guide: no block when teaching is off")
+
+        let d = Settings()
+        check(d.agentAwake && d.agentSleep && !d.agentPower && d.agentGuide && !d.agentDecides, "defaults: agents may keep awake and sleep, not restart")
+        let path = NSTemporaryDirectory() + "/aeval-agent-test.ini"
+        s.save(path)
+        let loaded = Settings.load(path)
+        try? FileManager.default.removeItem(atPath: path)
+        check(!loaded.agentAwake && loaded.agentSleep && loaded.agentPower && !loaded.agentGuide && loaded.agentDecides && loaded.notifyMode == 2,
+              "settings: agent control options survive a save and load")
+
+        check(AgentGuide.apply(nil, "") == nil, "guide: no file and nothing to add leaves no file")
+        check(AgentGuide.apply(nil, block) == block, "guide: a new file holds just the block")
+        let mine = "# My rules\n\nUse tabs.\n"
+        let added = AgentGuide.apply(mine, block)
+        check(added == "# My rules\n\nUse tabs.\n\n" + block, "guide: appended after the user's text")
+        check(AgentGuide.apply(added, block) == added, "guide: applying again changes nothing")
+        check(AgentGuide.apply(added, other) == "# My rules\n\nUse tabs.\n\n" + other, "guide: the block is replaced in place")
+        check(AgentGuide.apply(added, "") == mine, "guide: removing restores the user's text")
+        let middle = "Top\n\n" + block + "\nBottom\n"
+        check(AgentGuide.apply(middle, "") == "Top\n\nBottom\n", "guide: removing from the middle keeps both sides")
+        check(AgentGuide.apply(middle, other) == "Top\n\nBottom\n\n" + other, "guide: a replaced block moves to the end")
+        let crlf = "Top\r\n\r\n" + block
+        check(AgentGuide.apply(crlf, "") == "Top\n", "guide: Windows line endings around the block are trimmed")
+        check(AgentGuide.apply(block, "") == "", "guide: a file with only the block becomes empty")
+        let broken = "Keep\n" + AgentGuide.start + "\nhalf"
+        check(AgentGuide.apply(broken, block) == broken + "\n\n" + block, "guide: a start marker without an end is left alone")
     }
 
     static func easing() {

@@ -147,6 +147,7 @@ namespace Aevalsistant
         // whether these show a card.
         public bool Background;
         public double TurnSeconds;   // how long the turn that just ended took, when known
+        public bool FromAgent;       // sent by the agent itself with --notify
     }
 
     sealed class SessionBook
@@ -191,6 +192,24 @@ namespace Aevalsistant
                 if (nest) Children(s);
             }
             return rows;
+        }
+
+        // Busy sessions other than the one asking, for agent sleep and shutdown requests.
+        public List<Session> BusyBlockers(int exceptPid, long exceptStart, string exceptId) =>
+            All.Where(s => s.Busy && s.Id != exceptId
+                && !(s.Pid != 0 && s.Pid == exceptPid && (exceptStart == 0 || s.PidStart == exceptStart))).ToList();
+
+        // The session an agent command came from: by its agent process, else by folder.
+        public Session Find(int pid, long pidStart, string cwd)
+        {
+            if (pid != 0)
+            {
+                var byPid = All.FirstOrDefault(s => s.Pid == pid && (pidStart == 0 || s.PidStart == 0 || s.PidStart == pidStart));
+                if (byPid != null) return byPid;
+            }
+            string want = (cwd ?? "").TrimEnd('\\', '/');
+            return want.Length == 0 ? null
+                : All.FirstOrDefault(s => string.Equals(s.Cwd.TrimEnd('\\', '/'), want, StringComparison.OrdinalIgnoreCase));
         }
 
         // The session whose agent process started this one's, if this app knows it.
@@ -559,14 +578,26 @@ namespace Aevalsistant
         public bool Remind;               // repeat the card while an agent still needs you
         public int RemindAfter = 1;       // index into RemindMinutes
 
+        // What agents may do through Aevalsistant's command line.
+        public bool AgentAwake = true;    // --awake
+        public bool AgentSleep = true;    // --sleep
+        public bool AgentPower;           // --restart, --shutdown
+        public bool AgentGuide = true;    // keep a section in ~/.claude/CLAUDE.md that explains the commands
+        public bool AgentDecides;         // finish cards off; the agent sends its own with --notify
+
         public static readonly double[] MinTurnSeconds = { 0, 60, 300, 900 };
         public static readonly double[] RemindMinutes = { 2, 5, 10 };
 
-        // The "Notify me" choice: always, only when agents need you, or never.
+        // The "Notify me" choice: always, only when agents need you, when the agent decides, or never.
         public int NotifyMode
         {
-            get => !NotifyNeedsYou && !NotifyDone ? 2 : !NotifyDone ? 1 : 0;
-            set { NotifyDone = value == 0; NotifyNeedsYou = value != 2; }
+            get => !NotifyNeedsYou && !NotifyDone ? 3 : !NotifyDone && AgentDecides ? 2 : !NotifyDone ? 1 : 0;
+            set
+            {
+                NotifyDone = value == 0;
+                NotifyNeedsYou = value != 3;
+                AgentDecides = value == 2;
+            }
         }
 
         public static Settings Load(string path)
@@ -607,6 +638,11 @@ namespace Aevalsistant
                     case "minTurn": if (int.TryParse(v, out int m) && m >= 0 && m < MinTurnSeconds.Length) s.MinTurn = m; break;
                     case "remind": s.Remind = b; break;
                     case "remindAfter": if (int.TryParse(v, out int ra) && ra >= 0 && ra < RemindMinutes.Length) s.RemindAfter = ra; break;
+                    case "agentAwake": s.AgentAwake = b; break;
+                    case "agentSleep": s.AgentSleep = b; break;
+                    case "agentPower": s.AgentPower = b; break;
+                    case "agentGuide": s.AgentGuide = b; break;
+                    case "agentDecides": s.AgentDecides = b; break;
                 }
             }
             return s;
@@ -627,15 +663,19 @@ namespace Aevalsistant
                 "cardTime=" + CardTime.ToString(CultureInfo.InvariantCulture), "children=" + B(ShowChildren),
                 "watchApps=" + WatchedApp.FormatList(WatchApps), "watchAppsOn=" + B(WatchAppsOn), "notifyAway=" + B(NotifyAway),
                 "minTurn=" + MinTurn.ToString(CultureInfo.InvariantCulture), "remind=" + B(Remind),
-                "remindAfter=" + RemindAfter.ToString(CultureInfo.InvariantCulture), "",
+                "remindAfter=" + RemindAfter.ToString(CultureInfo.InvariantCulture),
+                "agentAwake=" + B(AgentAwake), "agentSleep=" + B(AgentSleep), "agentPower=" + B(AgentPower),
+                "agentGuide=" + B(AgentGuide), "agentDecides=" + B(AgentDecides), "",
             }));
         }
 
         // Whether a card should show for this request. Background cards also need their
         // parent setting on, since the menu nests them under it.
+        // A card the agent sent itself shows unless notifications are off altogether.
         public bool Wants(ToastRequest r) =>
             r.Kind == ToastKind.Info
-            || (r.Kind == ToastKind.NeedsYou ? NotifyNeedsYou && (!r.Background || NotifyBackgroundNeedsYou)
+            || (r.FromAgent ? NotifyDone || NotifyNeedsYou
+                : r.Kind == ToastKind.NeedsYou ? NotifyNeedsYou && (!r.Background || NotifyBackgroundNeedsYou)
                                              : NotifyDone && (!r.Background || NotifyBackgroundDone)
                                                && !(MinTurn > 0 && r.TurnSeconds > 0 && r.TurnSeconds < MinTurnSeconds[MinTurn]));
 
@@ -813,6 +853,187 @@ namespace Aevalsistant
             lines.Add("");
             Directory.CreateDirectory(Path.GetDirectoryName(path));
             File.WriteAllText(path, string.Join("\n", lines));
+        }
+    }
+
+    // A command an agent runs from its shell: Aevalsistant.exe --awake 2h "render", --sleep,
+    // --notify "Done" "details"... The client fills in where it came from and sends it as JSON.
+    sealed class AgentRequest
+    {
+        public string Action = "";   // awake, release, sleep, restart, shutdown, notify, status
+        public int Minutes;          // for awake; 0 holds until released
+        public string Reason = "", Title = "", Detail = "";
+        public bool NeedsYou;
+        public string Agent = "claude";
+        public string Pwd = "", Host = "";
+        public long Hwnd;
+        public int Pid;
+        public long PidStart;
+
+        public static readonly string[] Commands = { "--awake", "--sleep", "--restart", "--shutdown", "--notify", "--status" };
+
+        // "2h", "1h30m", "45" (minutes), "30m"; "on" is 0, until released. -1 when unusable.
+        public static int ParseMinutes(string s)
+        {
+            s = (s ?? "").Trim().ToLowerInvariant();
+            if (s == "on") return 0;
+            int total;
+            if (s.Length > 0 && s.All(char.IsDigit)) total = int.TryParse(s, out int m) ? m : -1;
+            else
+            {
+                var match = Regex.Match(s, @"^(?:(\d+)h)?(?:(\d+)m)?$");
+                if (!match.Success || (!match.Groups[1].Success && !match.Groups[2].Success)) return -1;
+                total = (match.Groups[1].Success ? int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture) * 60 : 0)
+                      + (match.Groups[2].Success ? int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture) : 0);
+            }
+            return total >= 1 && total <= 1440 ? total : -1;
+        }
+
+        // Arguments after the program name. Null when they do not make a command.
+        public static AgentRequest Parse(IList<string> args)
+        {
+            var r = new AgentRequest();
+            var rest = new List<string>();
+            for (int i = 0; i < args.Count; i++)
+            {
+                if (args[i] == "--needs-you") r.NeedsYou = true;
+                else if (args[i] == "--agent" && i + 1 < args.Count) r.Agent = args[++i];
+                else rest.Add(args[i]);
+            }
+            if (rest.Count == 0) return null;
+            string words(int from) => string.Join(" ", rest.Skip(from)).Trim();
+            switch (rest[0])
+            {
+                case "--awake":
+                    if (rest.Count < 2) return null;
+                    if (rest[1].Trim().ToLowerInvariant() == "off") { r.Action = "release"; return r; }
+                    r.Minutes = ParseMinutes(rest[1]);
+                    if (r.Minutes < 0) return null;
+                    r.Action = "awake";
+                    r.Reason = words(2);
+                    return r;
+                case "--sleep": r.Action = "sleep"; return r;
+                case "--restart": r.Action = "restart"; return r;
+                case "--shutdown": r.Action = "shutdown"; return r;
+                case "--status": r.Action = "status"; return r;
+                case "--notify":
+                    if (rest.Count < 2 || rest[1].Trim().Length == 0) return null;
+                    r.Action = "notify";
+                    r.Title = rest[1].Trim();
+                    r.Detail = words(2);
+                    return r;
+            }
+            return null;
+        }
+
+        public string ToJson() =>
+            "{\"cmd\":\"agent\",\"action\":" + Json.Quote(Action)
+            + ",\"minutes\":" + Minutes.ToString(CultureInfo.InvariantCulture)
+            + ",\"reason\":" + Json.Quote(Reason) + ",\"title\":" + Json.Quote(Title) + ",\"detail\":" + Json.Quote(Detail)
+            + ",\"needsYou\":" + (NeedsYou ? "true" : "false") + ",\"agent\":" + Json.Quote(Agent)
+            + ",\"pwd\":" + Json.Quote(Pwd) + ",\"host\":" + Json.Quote(Host)
+            + ",\"hwnd\":" + Hwnd.ToString(CultureInfo.InvariantCulture)
+            + ",\"pid\":" + Pid.ToString(CultureInfo.InvariantCulture)
+            + ",\"pidStart\":" + PidStart.ToString(CultureInfo.InvariantCulture) + "}";
+
+        public static AgentRequest From(string text)
+        {
+            if (!Json.TryParse(text, out var v) || !(v is JObj o) || o.Str("cmd") != "agent" || string.IsNullOrEmpty(o.Str("action"))) return null;
+            long N(string k) => (o[k] as JNum)?.AsLong() ?? 0;
+            return new AgentRequest
+            {
+                Action = o.Str("action"), Minutes = (int)N("minutes"),
+                Reason = o.Str("reason") ?? "", Title = o.Str("title") ?? "", Detail = o.Str("detail") ?? "",
+                NeedsYou = o["needsYou"] is bool b && b, Agent = string.IsNullOrEmpty(o.Str("agent")) ? "claude" : o.Str("agent"),
+                Pwd = o.Str("pwd") ?? "", Host = o.Str("host") ?? "",
+                Hwnd = N("hwnd"), Pid = (int)N("pid"), PidStart = N("pidStart"),
+            };
+        }
+    }
+
+    // An agent asking to keep the computer awake past its own turn.
+    sealed class Hold
+    {
+        public string Key = "", Label = "", Reason = "";
+        public DateTime Since;
+        public DateTime? Until;   // null: until released, or a day at most
+        public int Pid;
+        public long PidStart;
+    }
+
+    sealed class AwakeHolds
+    {
+        public static readonly TimeSpan Longest = TimeSpan.FromHours(24);
+        readonly List<Hold> holds = new List<Hold>();
+
+        public IReadOnlyList<Hold> All => holds;
+        public bool Active => holds.Count > 0;
+
+        public void Add(Hold h)
+        {
+            holds.RemoveAll(x => x.Key == h.Key);
+            holds.Add(h);
+        }
+
+        public bool Release(string key) => holds.RemoveAll(x => x.Key == key) > 0;
+
+        // Drops holds that ran out, and open-ended ones whose agent has exited.
+        public bool Sweep(DateTime now, Func<Hold, bool> alive) =>
+            holds.RemoveAll(h => (h.Until.HasValue ? h.Until.Value <= now : now - h.Since > Longest)
+                || (h.Pid != 0 && !alive(h))) > 0;
+
+        public static string Text(Hold h, DateTime now) =>
+            h.Until.HasValue ? Status.Duration((h.Until.Value - now).TotalSeconds) + " left" : "until released";
+    }
+
+    // The section Aevalsistant keeps in ~/.claude/CLAUDE.md so Claude knows the commands above.
+    static class AgentGuide
+    {
+        public const string Start = "<!-- aevalsistant:start -->", End = "<!-- aevalsistant:end -->";
+
+        public static string Block(string c, Settings s)
+        {
+            if (!s.AgentGuide) return "";
+            var lines = new List<string>
+            {
+                Start,
+                "## Aevalsistant",
+                "",
+                "Aevalsistant is the user's tray app that keeps this computer awake while agents work and shows notification cards. You can run these commands from the shell; each prints what happened.",
+                "",
+                "- `" + c + " --notify \"<title>\" \"<detail>\"` shows a card. Add `--needs-you` when you are blocked until the user answers.",
+            };
+            if (s.AgentAwake)
+                lines.Add("- `" + c + " --awake 2h \"<reason>\"` keeps the computer awake after your turn ends, for work that keeps running such as a render, a build, or a download. Use a duration like 30m, 2h or 1h30m, or `on` to hold until `" + c + " --awake off`. Release it when that work is done.");
+            if (s.AgentSleep) lines.Add("- `" + c + " --sleep` puts the computer to sleep. Only when the user asks for it.");
+            if (s.AgentPower) lines.Add("- `" + c + " --restart` and `" + c + " --shutdown` restart or shut down the computer. Only when the user asks for it.");
+            if (s.AgentSleep || s.AgentPower) lines.Add("- The app refuses these while another agent or a watched app is busy, and gives the user time to cancel.");
+            lines.Add("");
+            lines.Add(s.AgentDecides && !s.NotifyDone
+                ? "The user lets you decide when to notify them: automatic cards for finished turns are off. Run `--notify` when you finish something the user should look at, or when you are blocked on them, and not for quick back-and-forth replies."
+                : "Cards for finished turns and permission prompts are automatic, so use `--notify` only when the user asks for one or for work that finishes after your turn.");
+            lines.Add(End);
+            return string.Join("\n", lines) + "\n";
+        }
+
+        // The file with our section replaced, added, or (with an empty block) taken out. Null
+        // when there was no file and nothing to add.
+        public static string Apply(string text, string block)
+        {
+            string t = text ?? "";
+            int a = t.IndexOf(Start, StringComparison.Ordinal);
+            int b = a < 0 ? -1 : t.IndexOf(End, a, StringComparison.Ordinal);
+            string rest;
+            if (a >= 0 && b >= 0)
+            {
+                string before = t.Substring(0, a).TrimEnd('\n', '\r');
+                string after = t.Substring(b + End.Length).TrimStart('\n', '\r');
+                rest = before.Length == 0 ? after : after.Length == 0 ? before : before + "\n\n" + after;
+            }
+            else rest = t;
+            rest = rest.TrimEnd('\n', '\r');
+            if (block.Length == 0) return text == null ? null : rest.Length == 0 ? "" : rest + "\n";
+            return rest.Length == 0 ? block : rest + "\n\n" + block;
         }
     }
 

@@ -56,6 +56,12 @@ namespace Aevalsistant
         Choice notifyChoice;
         Note timeNote;
         AppPicker picker;
+        // Agent commands: holds on keep-awake, and a sleep, restart, or shutdown counting down.
+        readonly AwakeHolds holds = new AwakeHolds();
+        readonly System.Windows.Forms.Timer powerTimer = new System.Windows.Forms.Timer();
+        string powerKind, powerBy;
+        ToastRequest powerCard;
+        DateTime powerDue;
 
         public TrayApp()
         {
@@ -79,6 +85,8 @@ namespace Aevalsistant
             lidSleep.Tick += (s, e) => SleepIfLidStillShut();
 
             if (settings.Hooks) SyncAgents(true);
+            SyncGuide();
+            powerTimer.Tick += (s, e) => FirePower();
             if (settings.Chats) StartChats();
             ScanApps();
             SetStartup(settings.Startup);
@@ -106,6 +114,7 @@ namespace Aevalsistant
             sweep.Tick += (s, e) => Sweep();
             sweep.Start();
             new Thread(Listen) { IsBackground = true, Name = "hook-pipe" }.Start();
+            new Thread(ListenCommands) { IsBackground = true, Name = "command-pipe" }.Start();
 
             Updater.CleanUp();
             updateTimer.Tick += (s, e) =>
@@ -158,6 +167,25 @@ namespace Aevalsistant
                     }
                 }
                 catch (IOException) { Thread.Sleep(200); }   // a client vanished mid-write
+            }
+        }
+
+        // Agent commands come in on their own pipe, one message each, and get one message back.
+        void ListenCommands()
+        {
+            while (!quitting)
+            {
+                try
+                {
+                    CommandPipe.ServeOne(App.CommandPipeName, text =>
+                    {
+                        string reply = "Refused: not an agent command.";
+                        var req = AgentRequest.From(text);
+                        if (req != null) ui.Send(_ => reply = HandleAgent(req), null);
+                        return reply;
+                    });
+                }
+                catch (IOException) { Thread.Sleep(200); }   // the client left before the answer
             }
         }
 
@@ -216,9 +244,15 @@ namespace Aevalsistant
 
         // ---- toasts -------------------------------------------------------------------
 
+        // Why a card would not show, or null when it would.
+        string Unwanted(ToastRequest req) =>
+            !settings.Wants(req) ? "notifications are off (Aevalsistant settings)"
+            : settings.NotifyAway && req.Kind != ToastKind.Info && InFront(req) ? "the user is already looking at it"
+            : null;
+
         void Enqueue(ToastRequest req)
         {
-            if (!settings.Wants(req) || (settings.NotifyAway && req.Kind != ToastKind.Info && InFront(req)))
+            if (Unwanted(req) != null)
             {
                 // No card for this, but the list under a card already showing stays current.
                 if (toast.Showing) ShowTop(false);
@@ -268,7 +302,8 @@ namespace Aevalsistant
                 c.Overflow = (tree.Count - ToastArt.MaxRows) + " more in the tray menu";
 
             shown = c;
-            toast.Show(c, restartCountdown ? settings.Seconds(top.Kind) : -1);
+            double seconds = top == powerCard ? Math.Max(1, (powerDue - DateTime.UtcNow).TotalSeconds) : settings.Seconds(top.Kind);
+            toast.Show(c, restartCountdown ? seconds : -1);
         }
 
         // A subagent row focuses its session's window, since that is where it runs.
@@ -294,6 +329,12 @@ namespace Aevalsistant
         // Click on the main row or Alt+Tab: that session. Click on a listed row: that one.
         void Activate(int target)
         {
+            // The countdown card for a sleep or shutdown cancels it.
+            if (powerCard != null && pending.LastOrDefault(p => !p.WantsSnippet) == powerCard)
+            {
+                CancelPower();
+                return;
+            }
             string sid = null; long hwnd = 0;
             if (target >= 0 && shown != null && target < shown.Rows.Count)
             {
@@ -347,7 +388,7 @@ namespace Aevalsistant
                     catch (IOException) { return null; }
                     catch (UnauthorizedAccessException) { return null; }
                 });
-            bool appsChanged = ScanApps();
+            bool appsChanged = ScanApps() | holds.Sweep(DateTime.UtcNow, h => Terminals.IsAlive(h.Pid, h.PidStart));
             var now = DateTime.UtcNow;
             var active = book.All.Where(x => x.Busy).Select(x => TimeKeys.Agent(x.Agent)).Concat(appsOpen.Keys.Select(TimeKeys.App)).ToList();
             book.Credit(timeLog.Tick(now, TimeLog.DayString(DateTime.Now), active));
@@ -385,6 +426,177 @@ namespace Aevalsistant
                 Ingest(new HookEvent { Name = "SessionEnd", SessionId = s.Id });
         }
 
+        // ---- agent commands ---------------------------------------------------------------
+
+        static readonly Dictionary<string, string> PowerVerb = new Dictionary<string, string>
+        {
+            ["sleep"] = "put to sleep", ["restart"] = "restart", ["shutdown"] = "shut down",
+        };
+
+        string HandleAgent(AgentRequest req)
+        {
+            var session = book.Find(req.Pid, req.PidStart, req.Pwd);
+            string key = req.Pid != 0 ? "pid:" + req.Pid + ":" + req.PidStart : "cwd:" + req.Pwd.ToLowerInvariant();
+            string label = session?.Project ?? (req.Pwd.Length > 0 ? new Session { Cwd = req.Pwd }.Project : "An agent");
+            switch (req.Action)
+            {
+                case "awake":
+                    if (!settings.AgentAwake) return "Refused: agents may not keep this computer awake (Aevalsistant settings).";
+                    var now = DateTime.UtcNow;
+                    holds.Add(new Hold
+                    {
+                        Key = key, Label = label, Reason = req.Reason, Since = now, Pid = req.Pid, PidStart = req.PidStart,
+                        Until = req.Minutes > 0 ? now.AddMinutes(req.Minutes) : (DateTime?)null,
+                    });
+                    RefreshState();
+                    return req.Minutes > 0
+                        ? "Keeping the computer awake for " + Status.Duration(req.Minutes * 60) + (req.Reason.Length > 0 ? " (" + req.Reason + ")" : "") + "."
+                        : "Keeping the computer awake until you run --awake off.";
+
+                case "release":
+                    if (!holds.Release(key)) return "Nothing to release.";
+                    RefreshState();
+                    return "Released.";
+
+                case "sleep":
+                case "restart":
+                case "shutdown":
+                    string verb = PowerVerb[req.Action];
+                    if (!(req.Action == "sleep" ? settings.AgentSleep : settings.AgentPower))
+                        return "Refused: agents may not " + verb + " this computer (Aevalsistant settings).";
+                    if (powerKind != null) return "Refused: a " + powerKind + " is already pending.";
+                    if (holds.Release(key)) RefreshState();
+                    var busy = PowerBlockers(req, session);
+                    if (busy.Count > 0) return "Refused: still busy: " + string.Join(", ", busy) + ".";
+                    StartPower(req, session, label);
+                    return PowerTitle(req.Action) + " unless the user cancels.";
+
+                case "notify":
+                    var card = new ToastRequest
+                    {
+                        Kind = req.NeedsYou ? ToastKind.NeedsYou : ToastKind.Done, Title = req.Title, Detail = req.Detail, FromAgent = true,
+                        SessionId = session?.Id, Hwnd = session?.Hwnd ?? req.Hwnd, Host = session?.Where ?? req.Host,
+                    };
+                    string why = Unwanted(card);
+                    if (why != null) return "Not shown: " + why + ".";
+                    Enqueue(card);
+                    return "Shown.";
+
+                case "status":
+                    string reason = AwakeReason(book.BusyCount);
+                    return "Aevalsistant " + Updater.Current.ToString(3) + ": " + (reason.Length > 0 ? reason : "idle")
+                        + (settings.KeepAwake ? "" : ", keep-awake off") + ". Notify: "
+                        + new[] { "always", "if needed", "agent decides", "never" }[settings.NotifyMode]
+                        + (powerKind != null ? ". A " + powerKind + " is pending" : "") + ".";
+            }
+            return "Refused: unknown command.";
+        }
+
+        // What would be cut off: other busy sessions, open watched apps, other agents' holds.
+        List<string> PowerBlockers(AgentRequest req, Session asking)
+        {
+            var list = book.BusyBlockers(req.Pid, req.PidStart, asking?.Id).Select(x => x.Project + (x.Agent != "claude" ? " (" + Agents.Get(x.Agent).Name + ")" : "")).ToList();
+            list.AddRange(appsOpen.Keys.Select(n => AppLabel(n) + " open"));
+            list.AddRange(holds.All.Select(h => h.Label + " keeping awake"));
+            return list;
+        }
+
+        static string PowerTitle(string kind) =>
+            kind == "sleep" ? "Going to sleep in 15 seconds" : kind == "restart" ? "Restarting in 60 seconds" : "Shutting down in 60 seconds";
+
+        AgentRequest powerReq;
+
+        void StartPower(AgentRequest req, Session asking, string label)
+        {
+            powerKind = req.Action;
+            powerReq = req;
+            powerBy = asking?.Id;
+            int seconds = req.Action == "sleep" ? 15 : 60;
+            powerDue = DateTime.UtcNow.AddSeconds(seconds);
+            powerTimer.Interval = seconds * 1000;
+            powerTimer.Start();
+            powerCard = new ToastRequest
+            {
+                Kind = ToastKind.Info, Title = PowerTitle(req.Action), Detail = label + " asked for it. Click this card to cancel.",
+            };
+            pending.Add(powerCard);
+            if (settings.Sound) Sound.Play(ToastKind.NeedsYou);
+            ShowTop();
+        }
+
+        void ClearPower()
+        {
+            powerTimer.Stop();
+            if (powerCard != null) pending.Remove(powerCard);
+            powerKind = null;
+            powerCard = null;
+            powerReq = null;
+            powerBy = null;
+        }
+
+        void CancelPower()
+        {
+            if (powerKind == null) return;
+            string kind = powerKind == "shutdown" ? "shutdown" : powerKind;
+            ClearPower();
+            pending.Clear();
+            toast.Hide();
+            Enqueue(new ToastRequest { Kind = ToastKind.Info, Title = "Cancelled", Detail = "The " + kind + " was cancelled." });
+        }
+
+        // Checks once more before acting: work that started during the countdown wins.
+        void FirePower()
+        {
+            string kind = powerKind;
+            var req = powerReq;
+            string by = powerBy;
+            ClearPower();
+            if (kind == null || req == null) return;
+            if (pending.Count == 0) toast.Hide(); else ShowTop(false);
+            var busy = PowerBlockers(req, book.Get(by));
+            if (busy.Count > 0)
+            {
+                Enqueue(new ToastRequest { Kind = ToastKind.Info, Title = "Did not " + PowerVerb[kind], Detail = string.Join(", ", busy) + " became busy." });
+                return;
+            }
+            SaveTime();
+            Save();
+            if (kind == "sleep") { Battery.Suspend(hibernate: false); return; }
+            try
+            {
+                Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "shutdown.exe"), kind == "restart" ? "/r /t 0" : "/s /t 0")
+                {
+                    CreateNoWindow = true, UseShellExecute = false,
+                });
+            }
+            catch (System.ComponentModel.Win32Exception e)
+            {
+                Enqueue(new ToastRequest { Kind = ToastKind.Info, Title = "Could not " + PowerVerb[kind], Detail = e.Message });
+            }
+        }
+
+        string GuidePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "CLAUDE.md");
+
+        // Keeps the Aevalsistant section of ~/.claude/CLAUDE.md in step with Settings. The file is
+        // backed up once before the first change, like the agents' hook files.
+        void SyncGuide(bool remove = false)
+        {
+            string path = GuidePath;
+            try
+            {
+                string text = File.Exists(path) ? File.ReadAllText(path) : null;
+                string exe = hookCommand.EndsWith(" --hook", StringComparison.Ordinal) ? hookCommand.Substring(0, hookCommand.Length - 7) : hookCommand;
+                string next = AgentGuide.Apply(text, remove ? "" : AgentGuide.Block(exe, settings));
+                if (next == null || next == text) return;
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                string backup = path + ".aevalsistant.bak";
+                if (text != null && !File.Exists(backup)) File.WriteAllText(backup, text);
+                WriteConfig(path, next);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
         // ---- watched apps -----------------------------------------------------------------
 
         // Which watched apps are open. True when that changed.
@@ -408,6 +620,7 @@ namespace Aevalsistant
             var parts = new List<string>();
             if (working > 0) parts.Add(Plural.Agents(working) + " working");
             if (appsOpen.Count > 0) parts.Add(string.Join(" and ", appsOpen.Keys.Select(AppLabel)) + " open");
+            foreach (var h in holds.All) parts.Add(h.Label + " holding" + (h.Reason.Length > 0 ? " (" + h.Reason + ")" : ""));
             return string.Join(", ", parts);
         }
 
@@ -528,7 +741,7 @@ namespace Aevalsistant
             busyWindows = new HashSet<long>(book.All.Where(x => x.Busy && x.Agent != "chat" && x.Hwnd != 0).Select(x => x.Hwnd));
             TryApplyUpdate();
             int working = book.BusyCount;
-            bool on = working > 0 || appsOpen.Count > 0;
+            bool on = working > 0 || appsOpen.Count > 0 || holds.Active;
             bool keep = on && settings.KeepAwake;
             awake.Set(keep, keep && settings.DisplayOn);
 
@@ -582,7 +795,7 @@ namespace Aevalsistant
             lidSleep.Stop();
             uint? action = lidActionDue;
             lidActionDue = null;
-            if (action == null || book.BusyCount > 0 || appsOpen.Count > 0 || lid?.Closed != true) return;
+            if (action == null || book.BusyCount > 0 || appsOpen.Count > 0 || holds.Active || lid?.Closed != true) return;
             Battery.Suspend(hibernate: action == 2);
         }
 
@@ -605,7 +818,7 @@ namespace Aevalsistant
 
             int working = book.BusyCount;
             menu.Items.Add(Label("Aevalsistant " + Updater.Current.ToString(3), "header", bold: true));
-            bool busy = working > 0 || appsOpen.Count > 0;
+            bool busy = working > 0 || appsOpen.Count > 0 || holds.Active;
             menu.Items.Add(Label(!busy ? "Idle. Sleep is allowed."
                 : settings.KeepAwake ? "Keeping awake: " + AwakeReason(working)
                 : AwakeReason(working) + ". Sleep is allowed.", "status"));
@@ -643,6 +856,18 @@ namespace Aevalsistant
                 item.Image = Theme.Dot(dot, Theme.Slate, true);
                 menu.Items.Add(item);
             }
+            foreach (var h in holds.All.ToList())
+            {
+                var item = new ToolStripMenuItem(h.Label + " keeps awake" + (h.Reason.Length > 0 ? "  \u00B7  " + h.Reason : ""))
+                {
+                    ShortcutKeyDisplayString = AwakeHolds.Text(h, now),
+                    Image = Theme.Dot(dot, Theme.Slate, true),
+                    ToolTipText = "Click to release",
+                };
+                string key = h.Key;
+                item.Click += (o, e) => { holds.Release(key); RefreshState(); };
+                menu.Items.Add(item);
+            }
             string todaySummary = TimeLog.Summary(timeLog.Today, TimeLabel);
             if (todaySummary.Length > 0) menu.Items.Add(Label("Today: " + todaySummary, "status"));
             menu.Items.Add(new ToolStripSeparator());
@@ -653,6 +878,7 @@ namespace Aevalsistant
             if (chatProblem != null) menu.Items.Add(Label(chatProblem, "status"));
             if (justConnected.Count > 0) menu.Items.Add(Label("Restart open agent sessions once to connect them", "status"));
             if (pendingUpdate != null) menu.Items.Add(Label(updateStatus, "status"));
+            if (powerKind != null) menu.Items.Add(Command("Cancel the " + powerKind, CancelPower));
             menu.Items.Add(Command("Settings", OpenSettings));
             menu.Items.Add(Command("Quit", Quit));
         }
@@ -727,17 +953,20 @@ namespace Aevalsistant
             w.AddButton("Add an app\u2026", OpenPicker, watchToggle);
 
             w.Section("Notifications");
-            notifyChoice = w.AddChoice("Notify me", new[] { "Always", "When needed", "Never" }, settings.NotifyMode, i =>
+            notifyChoice = w.AddChoice("Notify", new[] { "Always", "If needed", "Agent decides", "Never" }, settings.NotifyMode, i =>
             {
                 settings.NotifyMode = i;
                 Save();
+                SyncGuide();
                 if (doneToggle != null) doneToggle.On = settings.NotifyDone;
                 if (asksToggle != null) asksToggle.On = settings.NotifyNeedsYou;
             });
             var done = doneToggle = w.AddToggle("Show a card when an agent finishes", null, settings.NotifyDone, v =>
             {
                 settings.NotifyDone = v;
+                if (v) settings.AgentDecides = false;
                 Save();
+                SyncGuide();
                 if (notifyChoice != null) notifyChoice.Selected = settings.NotifyMode;
             });
             w.AddToggle("Also when background agents finish", "Subagents, and agents that another agent started.",
@@ -796,6 +1025,15 @@ namespace Aevalsistant
                 RefreshSettingsNotes();
             });
             chatNote = w.AddNote(chatProblem ?? "", chat);
+
+            w.Section("Agent control");
+            w.AddToggle("Let agents keep the PC awake", "An agent can run --awake 2h to hold the PC awake after its turn ends.",
+                settings.AgentAwake, v => { settings.AgentAwake = v; Save(); SyncGuide(); });
+            w.AddToggle("Let agents put the PC to sleep", null, settings.AgentSleep, v => { settings.AgentSleep = v; Save(); SyncGuide(); });
+            w.AddToggle("Let agents restart or shut down the PC", "Refused while anything is busy, and you get 60 seconds to cancel.",
+                settings.AgentPower, v => { settings.AgentPower = v; Save(); SyncGuide(); });
+            w.AddToggle("Teach Claude Code these commands", "Adds a short section to ~/.claude/CLAUDE.md that follows these settings.",
+                settings.AgentGuide, v => { settings.AgentGuide = v; Save(); SyncGuide(); });
 
             w.Section("Time");
             timeNote = w.AddNote(TimeText());
@@ -946,6 +1184,7 @@ namespace Aevalsistant
                 "Aevalsistant", MessageBoxButtons.OKCancel, MessageBoxIcon.None, MessageBoxDefaultButton.Button2);
             if (answer != DialogResult.OK) return;
             SyncAgents(false);
+            SyncGuide(remove: true);
             SetStartup(false);
             // The exe cannot delete its own folder while running. cmd tries once a second for up
             // to 15 seconds, since a --hook call or a virus scan can hold the exe after this exits.
@@ -970,6 +1209,7 @@ namespace Aevalsistant
             if (Directory.Exists(App.Home)) { Save(); SaveTime(); }
             settingsWindow?.Close();
             lidSleep.Dispose();
+            powerTimer.Dispose();
             lid?.Dispose();
             chats?.Dispose();
             awake.Dispose();

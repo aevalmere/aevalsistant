@@ -30,6 +30,7 @@ namespace Aevalsistant
             Hierarchy();
             ChatWatching();
             Features();
+            AgentCommands();
             Check(Updater.ParseTag("v1.2.0") == new Version(1, 2, 0, 0) && Updater.ParseTag("1.10") == new Version(1, 10, 0, 0)
                 && Updater.ParseTag("v1.2.0") > new Version(1, 1, 0, 0) && Updater.ParseTag("v1.1.0") == new Version(1, 1, 0, 0)
                 && Updater.ParseTag("nightly") == null, "update: release tags compare against the build version");

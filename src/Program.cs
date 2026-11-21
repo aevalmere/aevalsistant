@@ -18,6 +18,7 @@ namespace Aevalsistant
         public static readonly string SettingsPath = Path.Combine(Home, "settings.ini");
         public static readonly string TimePath = Path.Combine(Home, "time.ini");
         public static readonly string PipeName = "aevalsistant." + Environment.UserName.ToLowerInvariant();
+        public static readonly string CommandPipeName = PipeName + ".cmd";   // agent commands, answered on the same pipe
         public const string MutexName = @"Local\Aevalsistant.Instance";
 
         [STAThread]
@@ -26,6 +27,10 @@ namespace Aevalsistant
             // --hook [agent] [event]: Claude Code passes no agent; Copilot CLI also passes the event.
             if (args.Length > 0 && args[0] == "--hook")
                 return HookClient.Run(args.Length > 1 ? args[1] : "claude", args.Length > 2 ? args[2] : "");
+
+            // --awake, --sleep, --restart, --shutdown, --notify, --status: run by an agent or by hand.
+            if (args.Length > 0 && Array.IndexOf(AgentRequest.Commands, args[0]) >= 0)
+                return AgentClient.Run(args);
 
             if (Native.IsElevatedByUac())
             {
@@ -159,6 +164,106 @@ namespace Aevalsistant
             catch (TimeoutException) { return false; }              // tray app not running
             catch (IOException) { return false; }                   // tray app quit mid-write
             catch (UnauthorizedAccessException) { return false; }   // tray app running elevated
+        }
+    }
+
+    // `Aevalsistant.exe --awake 2h "render"` and the other agent commands. Prints the tray app's
+    // answer. Exit code 0 when done, 1 when refused or not shown, 2 for bad usage or no tray app.
+    static class AgentClient
+    {
+        const string Usage =
+            "Usage: Aevalsistant.exe <command> [--agent <id>]\n"
+            + "  --awake <30m|2h|1h30m|on> [reason]   keep the computer awake after your turn ends\n"
+            + "  --awake off                          release that hold\n"
+            + "  --sleep | --restart | --shutdown     only when the user asks; refused while anything is busy\n"
+            + "  --notify <title> [detail] [--needs-you]   show a card\n"
+            + "  --status                             what the tray app is doing\n";
+
+        public static int Run(string[] args)
+        {
+            var req = AgentRequest.Parse(args);
+            if (req == null) { Write(Usage, error: true); return 2; }
+            if (!App.IsRunning()) { Write("Aevalsistant is not running.\n", error: true); return 2; }
+            req.Pwd = Environment.CurrentDirectory;
+            try
+            {
+                var t = Terminals.FromHookProcess(new Session { Cwd = req.Pwd }.Project, req.Agent);
+                req.Host = t.Host ?? "";
+                req.Hwnd = t.Window.ToInt64();
+                req.Pid = t.AgentPid;
+                req.PidStart = t.AgentStart;
+            }
+            catch (Exception) { /* the walk is a nicety: the folder still finds the session */ }
+            string reply = CommandPipe.Ask(App.CommandPipeName, req.ToJson());
+            if (reply == null) { Write("Aevalsistant did not answer.\n", error: true); return 2; }
+            Write(reply.EndsWith("\n", StringComparison.Ordinal) ? reply : reply + "\n", error: false);
+            return reply.StartsWith("Refused", StringComparison.Ordinal) || reply.StartsWith("Not shown", StringComparison.Ordinal) ? 1 : 0;
+        }
+
+        static void Write(string text, bool error)
+        {
+            try
+            {
+                using (var s = error ? Console.OpenStandardError() : Console.OpenStandardOutput())
+                {
+                    var bytes = new UTF8Encoding(false).GetBytes(text);
+                    s.Write(bytes, 0, bytes.Length);
+                }
+            }
+            catch (IOException) { /* nobody is reading */ }
+        }
+    }
+
+    // The agent command pipe: one message in, one message back.
+    static class CommandPipe
+    {
+        public static string Ask(string name, string json, int timeoutMs = 2000)
+        {
+            try
+            {
+                using (var pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut))
+                {
+                    pipe.Connect(timeoutMs);
+                    pipe.ReadMode = PipeTransmissionMode.Message;
+                    var bytes = Encoding.UTF8.GetBytes(json);
+                    pipe.Write(bytes, 0, bytes.Length);
+                    pipe.Flush();
+                    var ms = new MemoryStream();
+                    var buf = new byte[4096];
+                    do
+                    {
+                        int n = pipe.Read(buf, 0, buf.Length);
+                        if (n <= 0) break;
+                        ms.Write(buf, 0, n);
+                    } while (!pipe.IsMessageComplete);
+                    return Encoding.UTF8.GetString(ms.ToArray());
+                }
+            }
+            catch (TimeoutException) { return null; }
+            catch (IOException) { return null; }
+            catch (UnauthorizedAccessException) { return null; }
+        }
+
+        // Waits for one client, reads its message, and answers with handle's reply.
+        public static void ServeOne(string name, Func<string, string> handle)
+        {
+            using (var server = new NamedPipeServerStream(name, PipeDirection.InOut,
+                NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Message, PipeOptions.None))
+            {
+                server.WaitForConnection();
+                var ms = new MemoryStream();
+                var buf = new byte[1 << 16];
+                do
+                {
+                    int n = server.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    ms.Write(buf, 0, n);
+                } while (!server.IsMessageComplete && ms.Length < (1 << 20));
+                var bytes = Encoding.UTF8.GetBytes(handle(Encoding.UTF8.GetString(ms.ToArray())));
+                server.Write(bytes, 0, bytes.Length);
+                server.Flush();
+                server.WaitForPipeDrain();
+            }
         }
     }
 

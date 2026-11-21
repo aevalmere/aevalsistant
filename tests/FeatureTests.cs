@@ -38,7 +38,9 @@ namespace Aevalsistant
             mode.NotifyMode = 1;
             Check(!mode.NotifyDone && mode.NotifyNeedsYou && mode.NotifyMode == 1, "notify: only when agents need me");
             mode.NotifyMode = 2;
-            Check(!mode.NotifyDone && !mode.NotifyNeedsYou && mode.NotifyMode == 2, "notify: never");
+            Check(!mode.NotifyDone && mode.NotifyNeedsYou && mode.AgentDecides && mode.NotifyMode == 2, "notify: agent decides");
+            mode.NotifyMode = 3;
+            Check(!mode.NotifyDone && !mode.NotifyNeedsYou && !mode.AgentDecides && mode.NotifyMode == 3, "notify: never");
 
             var quick = new Settings { MinTurn = 1 };
             Check(!quick.Wants(new ToastRequest { Kind = ToastKind.Done, TurnSeconds = 30 })

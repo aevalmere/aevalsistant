@@ -113,6 +113,19 @@ input" command, with no start signal), and Cline (its hook format could not be c
   sleep does not count, to `agent:<id>` for each busy session's agent and `app:<name>` for each open
   watched app, today and in total. `SessionBook.Credit` adds the same step to each busy session's
   `Worked`. `time.ini` stores the totals, saved every minute and on quit.
+- **Agent commands.** `Aevalsistant.exe --awake|--sleep|--restart|--shutdown|--notify|--status`
+  is parsed by `AgentRequest.Parse` (Core), filled in with the same process walk as `--hook` (so
+  the tray app can tell which session is asking), and sent over a second pipe,
+  `aevalsistant.<user>.cmd`, in message mode so the tray app can answer on it (`CommandPipe`). The
+  hook pipe stays one-way. `TrayApp.HandleAgent` answers in one line. `AwakeHolds` keeps one hold
+  per asking agent process; an open hold counts like a busy session for keep-awake and ends when
+  its time runs out, after a day, or when that process exits. Sleep, restart and shutdown check
+  `SessionBook.BusyBlockers` (every busy session except the asking one), open watched apps and other
+  holds, start a 15 or 60 second countdown card that cancels on click, and check again before
+  `SetSuspendState` or `shutdown.exe /r|/s /t 0`. On the Mac the socket already answers, and
+  restart and shutdown go through System Events, which asks for Automation permission the first time. `AgentGuide` writes the matching section of
+  `~/.claude/CLAUDE.md` between marker comments, rebuilt whenever an agent setting or the Notify
+  choice changes, and removed on uninstall.
 - **Notification filters.** `Settings.Wants` also drops finish cards for turns shorter than the
   chosen minimum (`ToastRequest.TurnSeconds`, set on Stop and idle). "Only when I'm not looking"
   is checked in `TrayApp.Enqueue` against the foreground window. `SessionBook.Reminders` returns a
