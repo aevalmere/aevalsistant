@@ -6,7 +6,8 @@
     },
     {
       "owner": "mac-tests",
-      "pattern": [{ "regexp": "^(FAIL) (.*)$", "severity": 1, "message": 2 }]
+      "severity": "error",
+      "pattern": [{ "regexp": "^FAIL (.*)$", "message": 1 }]
     }
   ]
 }
