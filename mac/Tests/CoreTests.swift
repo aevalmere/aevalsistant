@@ -647,7 +647,10 @@ enum CoreTests {
         check(book.busyBlockers(exceptPid: 7, exceptStart: 99, exceptId: "s1").map { $0.id } == ["s2"], "agent: the requester is not its own blocker")
         check(book.busyBlockers(exceptPid: 7, exceptStart: 0, exceptId: nil).map { $0.id } == ["s2"], "agent: matched by pid alone when the start time is unknown")
         check(book.busyBlockers(exceptPid: 0, exceptStart: 0, exceptId: nil).count == 2, "agent: an unknown requester is blocked by every busy session")
-        _ = book.apply(ev("Stop", "s2", at: 3), t0)
+        let stop = ev("Stop", "s2", at: 3)
+        stop.pid = 8
+        stop.pidStart = 100
+        _ = book.apply(stop, t0)
         check(book.busyBlockers(exceptPid: 7, exceptStart: 99, exceptId: "s1").isEmpty, "agent: idle sessions do not block")
 
         check(book.find(pid: 8, pidStart: 100, cwd: "")?.id == "s2", "agent: the requester found by its process")
